@@ -191,4 +191,148 @@ def test_upload_large_file():
     assert data["size"] == len(large_content)
     logger.info("Large file uploaded successfully.")
 
-# 可以添加更多测试用例...
+def test_upload_json_object():
+    """测试上传单个 JSON 对象"""
+    logger.info("Testing upload JSON object...")
+    json_data = {
+        "data": {
+            "user": {
+                "name": "John Doe",
+                "age": 30,
+                "email": "john@example.com"
+            },
+            "tags": ["important", "customer"],
+            "active": True
+        },
+        "name": "user_profile"
+    }
+    
+    response = client.post("/upload/json", json=json_data)
+    
+    logger.info("JSON object uploaded. Checking response...")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["name"] == "user_profile"
+    assert data["content_type"] == "application/json"
+    
+    # 保存对象ID以供后续测试使用
+    global test_json_object_id
+    test_json_object_id = data["id"]
+    logger.info("JSON object uploaded successfully.")
+
+def test_upload_json_objects_batch():
+    """测试批量上传 JSON 对象"""
+    logger.info("Testing batch upload JSON objects...")
+    json_data = [
+        {
+            "data": {
+                "user": {"name": "Alice", "age": 25},
+                "tags": ["vip", "new"]
+            },
+            "name": "user_profile_1"
+        },
+        {
+            "data": {
+                "user": {"name": "Bob", "age": 35},
+                "tags": ["regular", "customer"]
+            },
+            "name": "user_profile_2"
+        }
+    ]
+    
+    response = client.post("/upload/json/batch", json=json_data)
+    
+    logger.info("JSON objects batch uploaded. Checking response...")
+    assert response.status_code == 200
+    assert len(response.json()) == 2
+    assert response.json()[0]["name"] == "user_profile_1"
+    assert response.json()[1]["name"] == "user_profile_2"
+    logger.info("JSON objects batch uploaded successfully.")
+
+def test_update_json_object():
+    """测试更新 JSON 对象"""
+    logger.info("Testing update JSON object...")
+    json_data = {
+        "data": {
+            "user": {
+                "name": "John Doe Updated",
+                "age": 31,
+                "email": "john.updated@example.com"
+            }
+        },
+        "name": "updated_user_profile"
+    }
+    
+    response = client.put(f"/update/json/{test_json_object_id}", json=json_data)
+    
+    logger.info("JSON object updated. Checking response...")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["name"] == "updated_user_profile"
+    logger.info("JSON object updated successfully.")
+
+def test_query_json_objects():
+    """测试 JSON 对象查询功能"""
+    logger.info("Testing JSON object query...")
+    
+    # 测试精确匹配查询
+    query_exact_name = {
+        "jsonpath": "$.user.name",
+        "value": "John Doe Updated"
+    }
+    response = client.post("/query/json", json=query_exact_name)
+    
+    logger.info("Querying JSON objects by exact name...")
+    assert response.status_code == 200
+    assert len(response.json()) > 0
+    
+    # 测试年龄大于查询
+    query_age_gt = {
+        "jsonpath": "$.user.age",
+        "value": 30,
+        "operator": "gt"
+    }
+    response = client.post("/query/json", json=query_age_gt)
+    
+    logger.info("Querying JSON objects by age greater than...")
+    assert response.status_code == 200
+    assert len(response.json()) > 0
+    
+    # 测试数组包含查询
+    query_tags_contains = {
+        "jsonpath": "$.tags[*]",
+        "value": "customer",
+        "operator": "contains"
+    }
+    response = client.post("/query/json", json=query_tags_contains)
+    
+    logger.info("Querying JSON objects by tags...")
+    assert response.status_code == 200
+    assert len(response.json()) > 0
+    
+    logger.info("JSON object query tests completed successfully.")
+
+def test_query_json_objects_pagination():
+    """测试 JSON 对象查询分页功能"""
+    logger.info("Testing JSON object query pagination...")
+    
+    # 测试限制返回数量
+    query_limit = {
+        "jsonpath": "$.user.age",
+        "value": 0,
+        "operator": "gt"
+    }
+    response = client.post("/query/json", json=query_limit, params={"limit": 1})
+    
+    logger.info("Querying JSON objects with limit...")
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    
+    # 测试偏移量
+    response = client.post("/query/json", json=query_limit, params={"limit": 1, "offset": 1})
+    
+    logger.info("Querying JSON objects with offset...")
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    
+    logger.info("JSON object query pagination tests completed successfully.")
