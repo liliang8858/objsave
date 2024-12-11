@@ -25,12 +25,12 @@ def http_client():
     """创建 HTTP 客户端"""
     return httpx.Client(base_url=BASE_URL)
 
-@pytest.fixture(scope="module")
-def uploaded_file_id():
-    return None
+# Global variable to store the uploaded file ID
+UPLOADED_FILE_ID = None
 
-def test_file_upload(http_client, uploaded_file_id):
+def test_file_upload(http_client):
     """测试文件上传接口"""
+    global UPLOADED_FILE_ID
     logger.info("开始测试文件上传接口...")
     
     # 准备测试文件
@@ -51,19 +51,18 @@ def test_file_upload(http_client, uploaded_file_id):
     assert upload_data["name"] == "test_upload.txt"
     assert upload_data["content_type"] == "text/plain"
     
-    # Update the uploaded_file_id fixture
-    uploaded_file_id = upload_data["id"]
-    
-    return uploaded_file_id
+    # Store the file ID globally
+    UPLOADED_FILE_ID = upload_data["id"]
 
-def test_file_download(http_client, uploaded_file_id):
+def test_file_download(http_client):
     """测试文件下载接口"""
-    # 先上传文件，再下载
-    file_id = test_file_upload(http_client, uploaded_file_id)
+    # 确保有文件可以下载
+    if not UPLOADED_FILE_ID:
+        test_file_upload(http_client)
 
-    logger.info(f"开始下载文件，文件ID: {file_id}")
+    logger.info(f"开始下载文件，文件ID: {UPLOADED_FILE_ID}")
 
-    response = http_client.get(f"/download/{file_id}")
+    response = http_client.get(f"/download/{UPLOADED_FILE_ID}")
 
     logger.info(f"下载响应状态码: {response.status_code}")
     logger.info(f"下载响应内容: {response.json()}")
@@ -76,34 +75,37 @@ def test_file_download(http_client, uploaded_file_id):
 
 def test_list_objects(http_client):
     """测试对象列表接口"""
-    # 先上传几个文件
-    test_file_upload(http_client, None)
-    test_file_upload(http_client, None)
+    # 确保有文件可以列出
+    if not UPLOADED_FILE_ID:
+        test_file_upload(http_client)
+        test_file_upload(http_client)
     
     logger.info("开始测试对象列表接口...")
     
     response = http_client.get("/list")
     
     logger.info(f"列表响应状态码: {response.status_code}")
-    logger.info(f"对象列表: {response.json()}")
+    logger.info(f"列表响应内容: {response.json()}")
     
     assert response.status_code == 200
-    objects = response.json()
     
+    objects = response.json()
     assert len(objects) >= 2
+    
     for obj in objects:
         assert "id" in obj
         assert "name" in obj
         assert "content_type" in obj
 
-def test_delete_object(http_client, uploaded_file_id):
+def test_delete_object(http_client):
     """测试对象删除接口"""
-    # 先上传文件
-    file_id = test_file_upload(http_client, uploaded_file_id)
+    # 确保有文件可以删除
+    if not UPLOADED_FILE_ID:
+        test_file_upload(http_client)
     
-    logger.info(f"开始删除文件，文件ID: {file_id}")
+    logger.info(f"开始删除文件，文件ID: {UPLOADED_FILE_ID}")
     
-    response = http_client.delete(f"/delete/{file_id}")
+    response = http_client.delete(f"/delete/{UPLOADED_FILE_ID}")
     
     logger.info(f"删除响应状态码: {response.status_code}")
     logger.info(f"删除响应内容: {response.json()}")
@@ -112,7 +114,7 @@ def test_delete_object(http_client, uploaded_file_id):
     assert response.json()["message"] == "对象删除成功"
     
     # 验证文件是否真的被删除
-    download_response = http_client.get(f"/download/{file_id}")
+    download_response = http_client.get(f"/download/{UPLOADED_FILE_ID}")
     assert download_response.status_code == 404
 
 def test_large_file_upload(http_client):
