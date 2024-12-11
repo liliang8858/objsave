@@ -2,6 +2,7 @@ import os
 import io
 import pytest
 import logging
+import json
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -207,17 +208,22 @@ def test_upload_json_object():
         "name": "user_profile"
     }
     
+    logger.info(f"上传的 JSON 数据: {json.dumps(json_data, indent=2)}")
+    
     response = client.post("/upload/json", json=json_data)
     
     logger.info("JSON object uploaded. Checking response...")
     assert response.status_code == 200
     data = response.json()
+    
+    logger.info(f"上传响应数据: {json.dumps(data, indent=2)}")
     assert data["name"] == "user_profile"
     assert data["content_type"] == "application/json"
     
     # 保存对象ID以供后续测试使用
     global test_json_object_id
     test_json_object_id = data["id"]
+    logger.info(f"上传的 JSON 对象 ID: {test_json_object_id}")
     logger.info("JSON object uploaded successfully.")
 
 def test_upload_json_objects_batch():
@@ -240,13 +246,20 @@ def test_upload_json_objects_batch():
         }
     ]
     
+    logger.info(f"批量上传的 JSON 数据: {json.dumps(json_data, indent=2)}")
+    
     response = client.post("/upload/json/batch", json=json_data)
     
     logger.info("JSON objects batch uploaded. Checking response...")
     assert response.status_code == 200
-    assert len(response.json()) == 2
-    assert response.json()[0]["name"] == "user_profile_1"
-    assert response.json()[1]["name"] == "user_profile_2"
+    batch_data = response.json()
+    
+    logger.info(f"批量上传响应数据: {json.dumps(batch_data, indent=2)}")
+    assert len(batch_data) == 2
+    assert batch_data[0]["name"] == "user_profile_1"
+    assert batch_data[1]["name"] == "user_profile_2"
+    
+    logger.info(f"批量上传的对象 ID: {[obj['id'] for obj in batch_data]}")
     logger.info("JSON objects batch uploaded successfully.")
 
 def test_update_json_object():
@@ -263,11 +276,16 @@ def test_update_json_object():
         "name": "updated_user_profile"
     }
     
+    logger.info(f"更新的 JSON 数据: {json.dumps(json_data, indent=2)}")
+    logger.info(f"待更新对象 ID: {test_json_object_id}")
+    
     response = client.put(f"/update/json/{test_json_object_id}", json=json_data)
     
     logger.info("JSON object updated. Checking response...")
     assert response.status_code == 200
     data = response.json()
+    
+    logger.info(f"更新响应数据: {json.dumps(data, indent=2)}")
     assert data["name"] == "updated_user_profile"
     logger.info("JSON object updated successfully.")
 
@@ -280,11 +298,16 @@ def test_query_json_objects():
         "jsonpath": "$.user.name",
         "value": "John Doe Updated"
     }
+    logger.info(f"精确名称查询参数: {json.dumps(query_exact_name, indent=2)}")
+    
     response = client.post("/query/json", json=query_exact_name)
     
     logger.info("Querying JSON objects by exact name...")
     assert response.status_code == 200
-    assert len(response.json()) > 0
+    exact_name_results = response.json()
+    
+    logger.info(f"精确名称查询结果: {json.dumps(exact_name_results, indent=2)}")
+    assert len(exact_name_results) > 0
     
     # 测试年龄大于查询
     query_age_gt = {
@@ -292,11 +315,16 @@ def test_query_json_objects():
         "value": 30,
         "operator": "gt"
     }
+    logger.info(f"年龄大于查询参数: {json.dumps(query_age_gt, indent=2)}")
+    
     response = client.post("/query/json", json=query_age_gt)
     
     logger.info("Querying JSON objects by age greater than...")
     assert response.status_code == 200
-    assert len(response.json()) > 0
+    age_gt_results = response.json()
+    
+    logger.info(f"年龄大于查询结果: {json.dumps(age_gt_results, indent=2)}")
+    assert len(age_gt_results) > 0
     
     # 测试数组包含查询
     query_tags_contains = {
@@ -304,11 +332,16 @@ def test_query_json_objects():
         "value": "customer",
         "operator": "contains"
     }
+    logger.info(f"标签包含查询参数: {json.dumps(query_tags_contains, indent=2)}")
+    
     response = client.post("/query/json", json=query_tags_contains)
     
     logger.info("Querying JSON objects by tags...")
     assert response.status_code == 200
-    assert len(response.json()) > 0
+    tags_contains_results = response.json()
+    
+    logger.info(f"标签包含查询结果: {json.dumps(tags_contains_results, indent=2)}")
+    assert len(tags_contains_results) > 0
     
     logger.info("JSON object query tests completed successfully.")
 
@@ -322,17 +355,25 @@ def test_query_json_objects_pagination():
         "value": 0,
         "operator": "gt"
     }
+    logger.info(f"分页查询（限制数量）参数: {json.dumps(query_limit, indent=2)}")
+    
     response = client.post("/query/json", json=query_limit, params={"limit": 1})
     
     logger.info("Querying JSON objects with limit...")
     assert response.status_code == 200
-    assert len(response.json()) == 1
+    limit_results = response.json()
+    
+    logger.info(f"分页查询（限制数量）结果: {json.dumps(limit_results, indent=2)}")
+    assert len(limit_results) == 1
     
     # 测试偏移量
     response = client.post("/query/json", json=query_limit, params={"limit": 1, "offset": 1})
     
     logger.info("Querying JSON objects with offset...")
     assert response.status_code == 200
-    assert len(response.json()) == 1
+    offset_results = response.json()
+    
+    logger.info(f"分页查询（偏移量）结果: {json.dumps(offset_results, indent=2)}")
+    assert len(offset_results) == 1
     
     logger.info("JSON object query pagination tests completed successfully.")
