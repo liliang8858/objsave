@@ -22,7 +22,7 @@ class ObjectMetadata(BaseModel):
     created_at: str
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 # 上传对象接口
 @app.post("/upload", response_model=ObjectMetadata)

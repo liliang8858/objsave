@@ -5,9 +5,21 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from pydantic import BaseModel
 
 from app import app, get_db
 from db import Base, ObjectStorage
+
+# 对象元数据模型
+class ObjectMetadata(BaseModel):
+    id: str
+    name: str
+    content_type: str
+    size: int
+    created_at: str
+
+    class Config:
+        from_attributes = True  # 替换 orm_mode = True
 
 # 创建测试数据库引擎
 TEST_DATABASE_URL = "sqlite:///:memory:"

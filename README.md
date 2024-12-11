@@ -9,6 +9,13 @@
 
 ## 安装依赖
 ```bash
+# 创建虚拟环境
+python -m venv objectstorage_env
+
+# 激活虚拟环境
+objectstorage_env\Scripts\activate
+
+# 安装依赖
 pip install -r requirements.txt
 ```
 
