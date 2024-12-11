@@ -39,5 +39,4 @@ htmlcov/
 build/
 dist/
 *.egg-info/
-objectstorge_env
 
