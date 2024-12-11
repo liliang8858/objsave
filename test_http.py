@@ -25,7 +25,11 @@ def http_client():
     """创建 HTTP 客户端"""
     return httpx.Client(base_url=BASE_URL)
 
-def test_file_upload(http_client):
+@pytest.fixture(scope="module")
+def uploaded_file_id():
+    return None
+
+def test_file_upload(http_client, uploaded_file_id):
     """测试文件上传接口"""
     logger.info("开始测试文件上传接口...")
     
@@ -47,20 +51,23 @@ def test_file_upload(http_client):
     assert upload_data["name"] == "test_upload.txt"
     assert upload_data["content_type"] == "text/plain"
     
-    return upload_data["id"]
+    # Update the uploaded_file_id fixture
+    uploaded_file_id = upload_data["id"]
+    
+    return uploaded_file_id
 
-def test_file_download(http_client):
+def test_file_download(http_client, uploaded_file_id):
     """测试文件下载接口"""
     # 先上传文件，再下载
-    file_id = test_file_upload(http_client)
-    
+    file_id = test_file_upload(http_client, uploaded_file_id)
+
     logger.info(f"开始下载文件，文件ID: {file_id}")
-    
+
     response = http_client.get(f"/download/{file_id}")
-    
+
     logger.info(f"下载响应状态码: {response.status_code}")
     logger.info(f"下载响应内容: {response.json()}")
-    
+
     assert response.status_code == 200
     download_data = response.json()
     
@@ -70,8 +77,8 @@ def test_file_download(http_client):
 def test_list_objects(http_client):
     """测试对象列表接口"""
     # 先上传几个文件
-    test_file_upload(http_client)
-    test_file_upload(http_client)
+    test_file_upload(http_client, None)
+    test_file_upload(http_client, None)
     
     logger.info("开始测试对象列表接口...")
     
@@ -89,10 +96,10 @@ def test_list_objects(http_client):
         assert "name" in obj
         assert "content_type" in obj
 
-def test_delete_object(http_client):
+def test_delete_object(http_client, uploaded_file_id):
     """测试对象删除接口"""
     # 先上传文件
-    file_id = test_file_upload(http_client)
+    file_id = test_file_upload(http_client, uploaded_file_id)
     
     logger.info(f"开始删除文件，文件ID: {file_id}")
     
