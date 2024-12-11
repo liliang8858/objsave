@@ -39,6 +39,19 @@ python app.py
 `DELETE /delete/{object_id}`
 - 根据对象ID删除文件
 
+## 运行测试
+```bash
+pytest test_app.py
+```
+
+### 测试覆盖的场景
+- 文件上传
+- 文件下载
+- 对象列表
+- 对象删除
+- 大文件处理
+- 错误场景处理
+
 ## 注意事项
 - 默认数据存储在 `data/objects.db`
 - 文件内容直接存储在SQLite数据库中
