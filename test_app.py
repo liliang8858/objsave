@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 # Configure logging
 def pytest_configure(config):
@@ -33,8 +33,7 @@ class ObjectMetadata(BaseModel):
     size: int
     created_at: str
 
-    class Config:
-        from_attributes = True  # 替换 orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 # 创建测试数据库引擎
 TEST_DATABASE_URL = "sqlite:///:memory:"

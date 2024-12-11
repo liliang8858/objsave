@@ -3,7 +3,7 @@ import uuid
 from typing import List, Optional
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from db import init_db, get_db, ObjectStorage
 
@@ -21,8 +21,7 @@ class ObjectMetadata(BaseModel):
     size: int
     created_at: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 # 上传对象接口
 @app.post("/upload", response_model=ObjectMetadata)
