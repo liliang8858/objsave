@@ -2,6 +2,7 @@ import os
 import uuid
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
 import json
@@ -11,6 +12,15 @@ from db import init_db, get_db, ObjectStorage
 
 # 创建FastAPI应用
 app = FastAPI(title="对象存储服务", description="轻量级本地对象存储HTTP服务")
+
+# 配置CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有源
+    allow_credentials=True,
+    allow_methods=["*"],  # 允许所有HTTP方法
+    allow_headers=["*"],  # 允许所有请求头
+)
 
 # 初始化数据库
 init_db()
