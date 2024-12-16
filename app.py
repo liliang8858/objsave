@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
 import json
-from jsonpath_ng import parse
+import jsonpath
 import logging
 from datetime import datetime
 
@@ -350,9 +350,20 @@ async def query_json_objects(
     - 大于等于 (ge)
     - 小于等于 (le)
     - 包含 (contains)
+    
+    JSONPath 示例:
+    - $.name                     (查询根级别的 name 字段)
+    - $.address.city            (查询嵌套的 city 字段)
+    - $.items[*]               (查询数组中的所有项)
+    - $.*.name                 (查询任意层级下的 name 字段)
+    - $.data[?(@.type=="idea")] (查询 data 数组中 type 为 "idea" 的项)
     """
     try:
         logger.debug(f"Querying JSON objects with path: {query.jsonpath}, value: {query.value}, operator: {query.operator}")
+        
+        # 验证 JSONPath 表达式
+        if not validate_jsonpath(query.jsonpath):
+            raise ValueError(f"Invalid JSONPath expression: {query.jsonpath}. JSONPath must start with '$'")
         
         # 查询所有 JSON 对象
         json_objects = db.query(ObjectStorage).filter(
@@ -363,22 +374,28 @@ async def query_json_objects(
         
         # 使用 JSONPath 和条件过滤
         matched_objects = []
-        jsonpath_expr = parse(query.jsonpath)
         
         for db_object in json_objects:
-            # 解析 JSON 内容
-            json_data = json.loads(db_object.content.decode('utf-8'))
-            
-            # 使用 JSONPath 查找匹配的值
-            matches = [match.value for match in jsonpath_expr.find(json_data)]
-            
-            # 根据不同操作符进行过滤
-            if matches:
-                for match in matches:
-                    if query.value is None or _apply_filter(match, query.value, query.operator):
-                        matched_objects.append((db_object, json_data))
-                        logger.debug(f"Matched object ID: {db_object.id}, name: {db_object.name}, match value: {match}")
-                        break
+            try:
+                # 解析 JSON 内容
+                json_data = json.loads(db_object.content.decode('utf-8'))
+                
+                # 使用 JSONPath 查找匹配的值
+                matches = jsonpath.jsonpath(json_data, query.jsonpath)
+                
+                # jsonpath.jsonpath 在没有匹配时返回 False
+                if matches is not False:
+                    for match in matches:
+                        if query.value is None or _apply_filter(match, query.value, query.operator):
+                            matched_objects.append((db_object, json_data))
+                            logger.debug(f"Matched object ID: {db_object.id}, name: {db_object.name}, match value: {match}")
+                            break
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to decode JSON for object {db_object.id}: {str(e)}")
+                continue
+            except Exception as e:
+                logger.warning(f"Error processing object {db_object.id}: {str(e)}")
+                continue
         
         logger.info(f"Query returned {len(matched_objects)} matches")
         
@@ -394,9 +411,23 @@ async def query_json_objects(
             ) for obj, data in matched_objects
         ]
     
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Error during JSON query: {str(e)}")
-        raise HTTPException(status_code=422, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+def validate_jsonpath(path: str) -> bool:
+    """验证 JSONPath 表达式的基本格式"""
+    if not path:
+        return False
+    # 检查基本格式
+    if not path.startswith('$'):
+        return False
+    # 允许 JSONPath 过滤表达式中的特殊字符
+    # 例如: $.data[?(@.type=="idea")] 是合法的
+    return True
 
 def _apply_filter(value, compare_value, operator):
     """
