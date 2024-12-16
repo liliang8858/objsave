@@ -7,8 +7,18 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
 import json
 from jsonpath_ng import parse
+import logging
+from datetime import datetime
 
 from db import init_db, get_db, ObjectStorage
+
+# 配置日志记录
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # 创建FastAPI应用
 app = FastAPI(title="对象存储服务", description="轻量级本地对象存储HTTP服务")
@@ -48,6 +58,17 @@ class JSONQueryModel(BaseModel):
     value: Optional[Any] = None  # 可选的精确匹配值
     operator: Optional[str] = 'eq'  # 比较运算符：eq, gt, lt, ge, le, contains
 
+# JSON对象响应模型
+class JSONObjectResponse(BaseModel):
+    id: str
+    name: str
+    content_type: str
+    size: int
+    created_at: str
+    data: Dict[str, Any]
+
+    model_config = ConfigDict(from_attributes=True)
+
 # 上传对象接口
 @app.post("/upload", response_model=ObjectMetadata)
 async def upload_object(
@@ -74,10 +95,14 @@ async def upload_object(
             size=len(content)
         )
         
+        logger.debug(f"Uploading file: {file.filename} (size: {len(content)} bytes, type: {file.content_type})")
+        
         # 保存到数据库
         db.add(db_object)
         db.commit()
         db.refresh(db_object)
+        
+        logger.info(f"Successfully uploaded file: {file.filename} with ID: {db_object.id}")
         
         return ObjectMetadata(
             id=db_object.id,
@@ -88,6 +113,7 @@ async def upload_object(
         )
     
     except Exception as e:
+        logger.error(f"Failed to upload file {file.filename}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"上传失败: {str(e)}")
 
 # 下载对象接口
@@ -102,10 +128,15 @@ async def download_object(
     - 返回完整的文件内容
     - 如果对象不存在，返回404错误
     """
+    logger.debug(f"Attempting to download object with ID: {object_id}")
+    
     db_object = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
     
     if not db_object:
+        logger.warning(f"Object not found with ID: {object_id}")
         raise HTTPException(status_code=404, detail="对象未找到")
+    
+    logger.info(f"Successfully retrieved object: {db_object.name} (ID: {object_id})")
     
     return {
         "file_name": db_object.name,
@@ -149,13 +180,19 @@ async def delete_object(
     
     - 如果对象不存在，返回404错误
     """
+    logger.debug(f"Attempting to delete object with ID: {object_id}")
+    
     db_object = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
     
     if not db_object:
+        logger.warning(f"Object not found with ID: {object_id}")
         raise HTTPException(status_code=404, detail="对象未找到")
     
+    object_name = db_object.name
     db.delete(db_object)
     db.commit()
+    
+    logger.info(f"Successfully deleted object: {object_name} (ID: {object_id})")
     
     return {"message": "对象删除成功"}
 
@@ -175,6 +212,9 @@ async def upload_json_object(
         # 序列化JSON数据
         content = json.dumps(json_data.data).encode('utf-8')
         
+        logger.debug(f"Uploading JSON object: {json_data.name or 'unnamed'} (size: {len(content)} bytes)")
+        logger.debug(f"JSON content: {json_data.data}")
+        
         # 创建新的存储对象
         db_object = ObjectStorage(
             id=str(uuid.uuid4()),
@@ -184,10 +224,12 @@ async def upload_json_object(
             size=len(content)
         )
         
-        # 添加到数据库
+        # 保存到数据库
         db.add(db_object)
         db.commit()
         db.refresh(db_object)
+        
+        logger.info(f"Successfully uploaded JSON object: {db_object.name} with ID: {db_object.id}")
         
         return ObjectMetadata(
             id=db_object.id,
@@ -197,6 +239,7 @@ async def upload_json_object(
             created_at=str(db_object.created_at)
         )
     except Exception as e:
+        logger.error(f"Failed to upload JSON object: {str(e)}")
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象批量上传接口
@@ -228,7 +271,7 @@ async def upload_json_objects_batch(
                 size=len(content)
             )
             
-            # 添加到数据库
+            # 保存到数据库
             db.add(db_object)
             
             # 收集元数据
@@ -290,7 +333,7 @@ async def update_json_object(
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象查询接口
-@app.post("/query/json", response_model=List[ObjectMetadata])
+@app.post("/query/json", response_model=List[JSONObjectResponse])
 async def query_json_objects(
     query: JSONQueryModel, 
     db: Session = Depends(get_db),
@@ -309,10 +352,14 @@ async def query_json_objects(
     - 包含 (contains)
     """
     try:
+        logger.debug(f"Querying JSON objects with path: {query.jsonpath}, value: {query.value}, operator: {query.operator}")
+        
         # 查询所有 JSON 对象
         json_objects = db.query(ObjectStorage).filter(
             ObjectStorage.content_type == "application/json"
         ).offset(offset).limit(limit).all()
+        
+        logger.debug(f"Found {len(json_objects)} JSON objects before filtering")
         
         # 使用 JSONPath 和条件过滤
         matched_objects = []
@@ -329,21 +376,26 @@ async def query_json_objects(
             if matches:
                 for match in matches:
                     if query.value is None or _apply_filter(match, query.value, query.operator):
-                        matched_objects.append(db_object)
+                        matched_objects.append((db_object, json_data))
+                        logger.debug(f"Matched object ID: {db_object.id}, name: {db_object.name}, match value: {match}")
                         break
         
-        # 转换为元数据
+        logger.info(f"Query returned {len(matched_objects)} matches")
+        
+        # 转换为响应模型
         return [
-            ObjectMetadata(
+            JSONObjectResponse(
                 id=obj.id,
                 name=obj.name,
                 content_type=obj.content_type,
                 size=obj.size,
-                created_at=str(obj.created_at)
-            ) for obj in matched_objects
+                created_at=str(obj.created_at),
+                data=data
+            ) for obj, data in matched_objects
         ]
     
     except Exception as e:
+        logger.error(f"Error during JSON query: {str(e)}")
         raise HTTPException(status_code=422, detail=str(e))
 
 def _apply_filter(value, compare_value, operator):
