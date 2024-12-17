@@ -48,6 +48,7 @@ curl -X POST -F "file=@/path/to/your/file" http://localhost:8000/upload
   {
     "file_name": "文件名",
     "content_type": "文件MIME类型",
+    "type": "对象类型（JSON对象）",
     "content": "文件内容（Base64编码）"
   }
   ```
@@ -116,8 +117,8 @@ curl -X DELETE http://localhost:8000/delete/{object_id}
 #### 请求参数
 ```json
 {
-  "type": "对象类型", // 可选
-  "data": {}, // 必填，任意 JSON 对象
+  "type": "对象类型", // 必填
+  "content": {}, // 必填，任意 JSON 对象
   "name": "可选的对象名称", // 可选
   "id": "可选的对象ID" // 可选
 }
@@ -133,7 +134,7 @@ curl -X DELETE http://localhost:8000/delete/{object_id}
     "content_type": "application/json",
     "size": "对象大小（字节）",
     "created_at": "创建时间",
-    "data": {}
+    "content": {}
   }
   ```
 
@@ -141,7 +142,7 @@ curl -X DELETE http://localhost:8000/delete/{object_id}
 ```bash
 curl -X POST http://localhost:8000/upload/json \
      -H "Content-Type: application/json" \
-     -d '{"type": "note", "data": {"key": "value"}, "name": "example_object"}'
+     -d '{"type": "note", "content": {"key": "value"}, "name": "example_object"}'
 ```
 
 ### 6. 批量上传 JSON 对象 `/upload/json/batch`
@@ -152,13 +153,13 @@ curl -X POST http://localhost:8000/upload/json \
 ```json
 [
   {
-    "type": "对象类型", // 可选
-    "data": {}, // 必填，第一个 JSON 对象
+    "type": "对象类型", // 必填
+    "content": {}, // 必填，第一个 JSON 对象
     "name": "可选的对象名称" // 可选
   },
   {
-    "type": "对象类型", // 可选
-    "data": {}, // 必填，第二个 JSON 对象
+    "type": "对象类型", // 必填
+    "content": {}, // 必填，第二个 JSON 对象
     "name": "可选的对象名称" // 可选
   }
 ]
@@ -175,7 +176,7 @@ curl -X POST http://localhost:8000/upload/json \
       "content_type": "application/json",
       "size": "对象大小（字节）",
       "created_at": "创建时间",
-      "data": {}
+      "content": {}
     },
     {
       "id": "第二个对象唯一标识符",
@@ -184,7 +185,7 @@ curl -X POST http://localhost:8000/upload/json \
       "content_type": "application/json",
       "size": "对象大小（字节）",
       "created_at": "创建时间",
-      "data": {}
+      "content": {}
     }
   ]
   ```
@@ -194,8 +195,8 @@ curl -X POST http://localhost:8000/upload/json \
 curl -X POST http://localhost:8000/upload/json/batch \
      -H "Content-Type: application/json" \
      -d '[
-           {"type": "note", "data": {"key1": "value1"}, "name": "object1"},
-           {"type": "task", "data": {"key2": "value2"}, "name": "object2"}
+           {"type": "note", "content": {"key1": "value1"}, "name": "object1"},
+           {"type": "task", "content": {"key2": "value2"}, "name": "object2"}
          ]'
 ```
 
@@ -209,8 +210,8 @@ curl -X POST http://localhost:8000/upload/json/batch \
 #### 请求参数
 ```json
 {
-  "type": "对象类型", // 可选
-  "data": {}, // 必填，新的 JSON 对象内容
+  "type": "对象类型", // 必填
+  "content": {}, // 必填，新的 JSON 对象内容
   "name": "可选的新对象名称" // 可选
 }
 ```
@@ -225,7 +226,7 @@ curl -X POST http://localhost:8000/upload/json/batch \
     "content_type": "application/json",
     "size": "新对象大小（字节）",
     "created_at": "创建时间",
-    "data": {}
+    "content": {}
   }
   ```
 - **错误响应** (404 Not Found): 对象不存在
@@ -234,7 +235,7 @@ curl -X POST http://localhost:8000/upload/json/batch \
 ```bash
 curl -X PUT http://localhost:8000/update/json/{object_id} \
      -H "Content-Type: application/json" \
-     -d '{"type": "note", "data": {"new_key": "new_value"}, "name": "updated_object"}'
+     -d '{"type": "note", "content": {"new_key": "new_value"}, "name": "updated_object"}'
 ```
 
 ### 8. JSON 对象查询 `/query/json`
@@ -273,7 +274,7 @@ curl -X PUT http://localhost:8000/update/json/{object_id} \
       "content_type": "application/json",
       "size": "对象大小（字节）",
       "created_at": "创建时间",
-      "data": {}
+      "content": {}
     }
   ]
   ```

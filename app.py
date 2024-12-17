@@ -48,8 +48,8 @@ class ObjectMetadata(BaseModel):
 # JSON对象模型
 class JSONObjectModel(BaseModel):
     id: Optional[str] = None
-    type: Optional[str] = None
-    data: Dict[str, Any]
+    type: str
+    content: Dict[str, Any]
     name: Optional[str] = None
     content_type: str = "application/json"
 
@@ -67,7 +67,7 @@ class JSONObjectResponse(BaseModel):
     size: int
     created_at: str
     type: Optional[str] = None
-    data: Dict[str, Any]
+    content: Dict[str, Any]
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -140,11 +140,23 @@ async def download_object(
     
     logger.info(f"Successfully retrieved object: {db_object.name} (ID: {object_id})")
     
-    return {
+    response_data = {
         "file_name": db_object.name,
         "content_type": db_object.content_type,
-        "content": db_object.content
+        "content": db_object.content,
+        "type": db_object.type
     }
+    
+    # 如果是JSON对象，添加type字段
+    if db_object.content_type == "application/json":
+        try:
+            json_content = json.loads(db_object.content)
+            if "type" in json_content:
+                response_data["type"] = json_content["type"]
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse JSON content for object ID: {object_id}")
+    
+    return response_data
 
 # 列出所有对象接口
 @app.get("/list", response_model=List[ObjectMetadata])
@@ -212,17 +224,19 @@ async def upload_json_object(
     """
     try:
         # 序列化JSON数据
-        content = json.dumps(json_data.data).encode('utf-8')
+        content = json.dumps(json_data.content, ensure_ascii=False).encode('utf-8')
         
         logger.debug(f"Uploading JSON object: {json_data.name or 'unnamed'} (size: {len(content)} bytes)")
-        logger.debug(f"JSON content: {json_data.data}")
+        logger.debug(f"JSON content: {json_data.content}")
+        logger.debug(f"JSON type: {json_data.type}")
         
         # 创建新的存储对象
         db_object = ObjectStorage(
-            id=str(uuid.uuid4()),
-            name=json_data.name or "unnamed_json_object",
+            id=json_data.id or str(uuid.uuid4()),
+            name=json_data.name or f"json_object_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             content=content,
             content_type="application/json",
+            type=json_data.type,
             size=len(content)
         )
         
@@ -260,23 +274,27 @@ async def upload_json_objects_batch(
         # 存储所有对象并收集元数据
         metadata_list = []
         
+        db_objects = []
         for json_data in json_objects:
             # 序列化JSON数据
-            content = json.dumps(json_data.data).encode('utf-8')
+            content = json.dumps(json_data.content, ensure_ascii=False).encode('utf-8')
             
             # 创建新的存储对象
             db_object = ObjectStorage(
-                id=str(uuid.uuid4()),
-                name=json_data.name or "unnamed_json_object",
+                id=json_data.id or str(uuid.uuid4()),
+                name=json_data.name or f"json_object_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                 content=content,
                 content_type="application/json",
+                type=json_data.type,
                 size=len(content)
             )
-            
-            # 保存到数据库
-            db.add(db_object)
-            
-            # 收集元数据
+            db_objects.append(db_object)
+        
+        # 保存到数据库
+        db.add_all(db_objects)
+        db.commit()
+        
+        for db_object in db_objects:
             metadata_list.append(ObjectMetadata(
                 id=db_object.id,
                 name=db_object.name,
@@ -284,9 +302,6 @@ async def upload_json_objects_batch(
                 size=db_object.size,
                 created_at=str(db_object.created_at)
             ))
-        
-        # 提交数据库事务
-        db.commit()
         
         return metadata_list
     except Exception as e:
@@ -313,7 +328,7 @@ async def update_json_object(
             raise HTTPException(status_code=404, detail="对象未找到")
         
         # 序列化新的JSON数据
-        content = json.dumps(json_data.data).encode('utf-8')
+        content = json.dumps(json_data.content).encode('utf-8')
         
         # 更新对象
         db_object.content = content
@@ -368,35 +383,34 @@ async def query_json_objects(
             raise ValueError(f"Invalid JSONPath expression: {query.jsonpath}. JSONPath must start with '$'")
         
         # 查询所有 JSON 对象
-        json_objects = db.query(ObjectStorage).filter(
+        objects = db.query(ObjectStorage).filter(
             ObjectStorage.content_type == "application/json"
         ).offset(offset).limit(limit).all()
         
-        logger.debug(f"Found {len(json_objects)} JSON objects before filtering")
+        logger.debug(f"Found {len(objects)} JSON objects before filtering")
         
         # 使用 JSONPath 和条件过滤
         matched_objects = []
         
-        for db_object in json_objects:
+        for obj in objects:
             try:
-                # 解析 JSON 内容
-                json_data = json.loads(db_object.content.decode('utf-8'))
+                # 解析JSON内容
+                content = json.loads(obj.content)
                 
                 # 使用 JSONPath 查找匹配的值
-                matches = jsonpath.jsonpath(json_data, query.jsonpath)
+                found_values = jsonpath.jsonpath(content, query.jsonpath)
                 
-                # jsonpath.jsonpath 在没有匹配时返回 False
-                if matches is not False:
-                    for match in matches:
-                        if query.value is None or _apply_filter(match, query.value, query.operator):
-                            matched_objects.append((db_object, json_data))
-                            logger.debug(f"Matched object ID: {db_object.id}, name: {db_object.name}, match value: {match}")
+                if found_values:
+                    # 如果找到匹配项，应用过滤器
+                    for value in found_values:
+                        if query.value is None or _apply_filter(value, query.value, query.operator):
+                            matched_objects.append((obj, content))
                             break
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to decode JSON for object {db_object.id}: {str(e)}")
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse JSON content for object ID: {obj.id}")
                 continue
             except Exception as e:
-                logger.warning(f"Error processing object {db_object.id}: {str(e)}")
+                logger.error(f"Error processing object {obj.id}: {str(e)}")
                 continue
         
         logger.info(f"Query returned {len(matched_objects)} matches")
@@ -409,9 +423,9 @@ async def query_json_objects(
                 content_type=obj.content_type,
                 size=obj.size,
                 created_at=str(obj.created_at),
-                type=json_data.get('type'),
-                data=json_data
-            ) for obj, json_data in matched_objects
+                type=content.get('type'),
+                content=content
+            ) for obj, content in matched_objects
         ]
     
     except ValueError as e:
