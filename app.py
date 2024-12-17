@@ -15,7 +15,7 @@ from db import init_db, get_db, ObjectStorage
 # 配置日志记录
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - [%(pathname)s:%(lineno)d] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ class JSONQueryModel(BaseModel):
     jsonpath: str  # JSONPath查询表达式
     value: Optional[Any] = None  # 可选的精确匹配值
     operator: Optional[str] = 'eq'  # 比较运算符：eq, gt, lt, ge, le, contains
+    type: Optional[str] = None  # JSON对象类型
 
 # JSON对象响应模型
 class JSONObjectResponse(BaseModel):
@@ -226,17 +227,17 @@ async def upload_json_object(
         # 序列化JSON数据
         content = json.dumps(json_data.content, ensure_ascii=False).encode('utf-8')
         
-        logger.debug(f"Uploading JSON object: {json_data.name or 'unnamed'} (size: {len(content)} bytes)")
+        logger.debug(f"Uploading JSON object: {json_data.name or 'untitled.json'} (size: {len(content)} bytes)")
         logger.debug(f"JSON content: {json_data.content}")
         logger.debug(f"JSON type: {json_data.type}")
         
         # 创建新的存储对象
         db_object = ObjectStorage(
             id=json_data.id or str(uuid.uuid4()),
-            name=json_data.name or f"json_object_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            name=json_data.name or "untitled.json",
             content=content,
             content_type="application/json",
-            type=json_data.type,
+            type=json_data.type,  # 设置type字段
             size=len(content)
         )
         
@@ -382,12 +383,54 @@ async def query_json_objects(
         if not validate_jsonpath(query.jsonpath):
             raise ValueError(f"Invalid JSONPath expression: {query.jsonpath}. JSONPath must start with '$'")
         
-        # 查询所有 JSON 对象
-        objects = db.query(ObjectStorage).filter(
+        # 解析 JSONPath 表达式中的条件
+        def extract_condition_from_jsonpath(path: str) -> tuple:
+            """从 JSONPath 表达式中提取条件
+            例如: $[?(@.type=="idea")] -> ("type", "idea")
+            """
+            import re
+            # 匹配 JSONPath 条件表达式
+            pattern = r'\$\[\?\(@\.(\w+)==["\'](.+)["\']\)\]'
+            match = re.match(pattern, path)
+            if match:
+                return match.groups()
+            return None, None
+
+        # 构建基础查询
+        base_query = db.query(ObjectStorage).filter(
             ObjectStorage.content_type == "application/json"
-        ).offset(offset).limit(limit).all()
+        )
         
+        # 从 JSONPath 中提取查询条件
+        field, value = extract_condition_from_jsonpath(query.jsonpath)
+        if field and value:
+            # 将 JSONPath 条件转换为 SQL 查询
+            base_query = base_query.filter(getattr(ObjectStorage, field) == value)
+        elif query.type:  # 如果没有 JSONPath 条件但有 type 参数
+            base_query = base_query.filter(ObjectStorage.type == query.type)
+            
+        # 打印 SQL 查询语句
+        logger.debug(f"SQL Query: {base_query.statement}")
+            
+        # 执行分页查询    
+        objects = base_query.offset(offset).limit(limit).all()
+        
+        # 打印查询到的对象
+        logger.debug("Query results:")
+        for obj in objects:
+            logger.debug(f"Object: {obj.__dict__}")
+            
         logger.debug(f"Found {len(objects)} JSON objects before filtering")
+        logger.debug(f"Query JSONPath: {query.jsonpath}")
+        
+        # 打印每个对象的关键信息
+        for obj in objects:
+            try:
+                content = json.loads(obj.content)
+                logger.debug(f"Object[{obj.id}] - Type: {obj.type}, Content：field: {content}")
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse JSON content for object ID: {obj.id}")
+                continue
         
         # 使用 JSONPath 和条件过滤
         matched_objects = []
@@ -396,16 +439,12 @@ async def query_json_objects(
             try:
                 # 解析JSON内容
                 content = json.loads(obj.content)
+                matched_objects.append((obj, content))
+                logger.debug("Matched objects:")
+                for obj2, content2 in matched_objects:
+                    logger.debug(f"Object[{obj2.id}] - Type: {obj2.type}, Content: {content2}")
+
                 
-                # 使用 JSONPath 查找匹配的值
-                found_values = jsonpath.jsonpath(content, query.jsonpath)
-                
-                if found_values:
-                    # 如果找到匹配项，应用过滤器
-                    for value in found_values:
-                        if query.value is None or _apply_filter(value, query.value, query.operator):
-                            matched_objects.append((obj, content))
-                            break
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON content for object ID: {obj.id}")
                 continue
@@ -423,7 +462,7 @@ async def query_json_objects(
                 content_type=obj.content_type,
                 size=obj.size,
                 created_at=str(obj.created_at),
-                type=content.get('type'),
+                type=obj.type,
                 content=content
             ) for obj, content in matched_objects
         ]
