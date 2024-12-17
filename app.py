@@ -48,6 +48,7 @@ class ObjectMetadata(BaseModel):
 # JSON对象模型
 class JSONObjectModel(BaseModel):
     id: Optional[str] = None
+    type: Optional[str] = None
     data: Dict[str, Any]
     name: Optional[str] = None
     content_type: str = "application/json"
@@ -65,6 +66,7 @@ class JSONObjectResponse(BaseModel):
     content_type: str
     size: int
     created_at: str
+    type: Optional[str] = None
     data: Dict[str, Any]
 
     model_config = ConfigDict(from_attributes=True)
@@ -407,8 +409,9 @@ async def query_json_objects(
                 content_type=obj.content_type,
                 size=obj.size,
                 created_at=str(obj.created_at),
-                data=data
-            ) for obj, data in matched_objects
+                type=json_data.get('type'),
+                data=json_data
+            ) for obj, json_data in matched_objects
         ]
     
     except ValueError as e:
