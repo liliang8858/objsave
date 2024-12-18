@@ -14,6 +14,7 @@ import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
+from contextlib import asynccontextmanager
 
 from db import init_db, get_db, ObjectStorage
 from cache_manager import CacheManager
@@ -47,12 +48,24 @@ thread_pool = ThreadPoolExecutor(
 )
 
 # 创建FastAPI应用
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting up server...")
+    logger.info(f"Available workers: {thread_pool._max_workers}")
+    logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
+    yield
+    # Shutdown
+    logger.info("Shutting down server...")
+    thread_pool.shutdown(wait=True)
+
 app = FastAPI(
     title="对象存储服务",
     description="轻量级本地对象存储HTTP服务",
     openapi_url="/objsave/openapi.json",
     docs_url="/objsave/docs",
-    redoc_url="/objsave/redoc"
+    redoc_url="/objsave/redoc",
+    lifespan=lifespan
 )
 
 # 配置CORS
@@ -645,21 +658,6 @@ def _apply_filter(value, compare_value, operator):
             raise ValueError(f"不支持的运算符: {operator}")
     except TypeError:
         return False
-
-# 启动事件处理
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting up server...")
-    logger.info(f"Available workers: {thread_pool._max_workers}")
-    logger.info(f"Memory limit: {cache._max_memory / (1024*1024):.2f}MB")
-    logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
-
-# 关闭事件处理
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Shutting down server...")
-    thread_pool.shutdown(wait=True)
-    cache.clear()
 
 # 将路由添加到主应用
 app.include_router(api_router)
