@@ -82,13 +82,17 @@ async def lifespan(app: FastAPI):
 
 # 创建FastAPI应用
 app = FastAPI(
-    title="对象存储服务",
-    description="企业级对象存储服务",
+    title="ObjSave API",
+    description="高性能对象存储服务",
     version="1.0.0",
+    lifespan=lifespan,
     docs_url="/objsave/docs",
     redoc_url="/objsave/redoc",
-    lifespan=lifespan
+    openapi_url="/objsave/openapi.json"
 )
+
+# 添加GZip压缩
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # 配置CORS
 app.add_middleware(
@@ -98,10 +102,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# 创建路由前缀
-api_router = APIRouter(prefix="/objsave")
+# 创建路由器
+router = APIRouter(prefix="/objsave")
 
 # 对象元数据模型
 class ObjectMetadata(BaseModel):
@@ -229,7 +232,7 @@ def require_permission(permission: str):
     return decorator
 
 # 健康检查接口
-@app.get("/health")
+@router.get("/health")
 async def health_check():
     """系统健康检查"""
     try:
@@ -253,7 +256,7 @@ async def health_check():
         raise HTTPException(status_code=500, detail="Health check failed")
 
 # 上传对象接口
-@app.post("/upload")
+@router.post("/upload")
 @require_permission("write")
 async def upload_object(
     file: UploadFile = File(...),
@@ -331,7 +334,7 @@ async def upload_object(
         raise HTTPException(status_code=500, detail="Upload failed")
 
 # 下载对象接口
-@app.get("/download/{object_id}")
+@router.get("/download/{object_id}")
 @require_permission("read")
 async def download_object(
     object_id: str,
@@ -394,7 +397,7 @@ async def download_object(
         raise HTTPException(status_code=500, detail="Download failed")
 
 # 列出所有对象接口
-@app.get("/list", response_model=List[ObjectMetadata])
+@router.get("/list", response_model=List[ObjectMetadata])
 async def list_objects(
     db: Session = Depends(get_db),
     limit: Optional[int] = 100,
@@ -440,7 +443,7 @@ async def list_objects(
         raise HTTPException(status_code=500, detail=f"获取列表失败: {str(e)}")
 
 # JSON对象上传接口
-@app.post("/upload/json", response_model=ObjectMetadata)
+@router.post("/upload/json", response_model=ObjectMetadata)
 async def upload_json_object(
     json_data: JSONObjectModel, 
     db: Session = Depends(get_db)
@@ -499,7 +502,7 @@ async def upload_json_object(
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象批量上传接口
-@app.post("/upload/json/batch", response_model=List[ObjectMetadata])
+@router.post("/upload/json/batch", response_model=List[ObjectMetadata])
 async def upload_json_objects_batch(
     json_objects: List[JSONObjectModel], 
     db: Session = Depends(get_db)
@@ -559,7 +562,7 @@ async def upload_json_objects_batch(
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象更新接口
-@app.put("/update/json/{object_id}", response_model=ObjectMetadata)
+@router.put("/update/json/{object_id}", response_model=ObjectMetadata)
 async def update_json_object(
     object_id: str,
     json_data: JSONObjectModel, 
@@ -624,7 +627,7 @@ async def update_json_object(
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象查询接口
-@app.post("/query/json", response_model=List[JSONObjectResponse])
+@router.post("/query/json", response_model=List[JSONObjectResponse])
 async def query_json_objects(
     query: JSONQueryModel, 
     db: Session = Depends(get_db),
@@ -771,8 +774,8 @@ def _apply_filter(value, compare_value, operator):
     except TypeError:
         return False
 
-# 将路由添加到主应用
-app.include_router(api_router)
+# 注册路由
+app.include_router(router)
 
 # 启动服务器配置
 if __name__ == "__main__":
