@@ -38,9 +38,7 @@ resource_manager = ResourceManager()
 # 创建缓存管理器实例
 cache = CacheManager(
     max_items=10000,
-    shards=8,
-    default_ttl=3600,
-    max_memory_mb=int(resource_manager.get_memory_limit() / (1024 * 1024))
+    shards=8
 )
 
 # 创建线程池
@@ -674,12 +672,13 @@ if __name__ == "__main__":
     workers = min(multiprocessing.cpu_count(), 4)
     
     uvicorn.run(
-        app,
+        "app:app",
         host="0.0.0.0",
         port=8000,
         workers=workers,
         limit_concurrency=1000,
         limit_max_requests=10000,
         timeout_keep_alive=5,
-        log_level="warning"
+        log_level="warning",
+        reload=True
     )
