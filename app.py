@@ -233,12 +233,14 @@ async def upload_json_object(
     - 存储JSON内容和元数据
     """
     try:
+        # 检查并转换输入数据
+        if isinstance(json_data, dict):
+            json_data = JSONObjectModel(**json_data)
+        
+        content_str = json.dumps(json_data.content)
+        
         # 生成唯一ID
         object_id = str(uuid.uuid4())
-        
-        # 转换JSON数据为字符串
-        json_content = json_data.content.model_dump() if hasattr(json_data, 'content') else {}
-        content_str = json.dumps(json_content, ensure_ascii=False)
         
         # 获取当前时间
         current_time = datetime.now().isoformat()
