@@ -2,8 +2,8 @@ import os
 import uuid
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, APIRouter, Request, Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
 import json
@@ -15,10 +15,14 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 from contextlib import asynccontextmanager
-
-from db import init_db, get_db, ObjectStorage
+from request_queue import RequestQueue
+from security_manager import SecurityManager
+from storage_manager import StorageManager
 from cache_manager import CacheManager
-from resource_manager import ResourceManager
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.gzip import GZipMiddleware
+from models import ObjectStorage, ObjectMetadata
+from database import get_db, init_db
 
 # 配置日志记录
 logging.basicConfig(
@@ -30,39 +34,57 @@ logger = logging.getLogger(__name__)
 
 # 系统配置
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
-MAX_CONCURRENT_REQUESTS = 500
+MAX_WORKERS = min(32, multiprocessing.cpu_count() * 2)  # 工作线程数
 CHUNK_SIZE = 8192  # 8KB
 
-# 创建资源管理器
-resource_manager = ResourceManager()
+# 创建线程池
+thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+# 创建存储管理器实例
+storage = StorageManager()
 
 # 创建缓存管理器实例
 cache = CacheManager(
-    max_items=10000,
-    shards=8
+    max_items=10000,  # 最大缓存项数
+    shards=16  # 增加分片数以减少锁竞争
 )
 
-# 创建线程池
-thread_pool = ThreadPoolExecutor(
-    max_workers=resource_manager.get_available_workers()
-)
+# 创建管理器实例
+security = SecurityManager()
+request_queue = RequestQueue(max_workers=MAX_WORKERS)
 
-# 创建FastAPI应用
+# 认证方案
+security_bearer = HTTPBearer()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up server...")
-    logger.info(f"Available workers: {thread_pool._max_workers}")
-    logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
-    yield
-    # Shutdown
-    logger.info("Shutting down server...")
-    thread_pool.shutdown(wait=True)
+    logger.info(f"Available workers: {MAX_WORKERS}")
+    
+    # 初始化数据库
+    init_db()
+    
+    # 启动请求队列处理器
+    await request_queue.start()
+    
+    try:
+        yield
+    except Exception as e:
+        logger.error(f"Server error: {str(e)}")
+    finally:
+        # Shutdown
+        logger.info("Shutting down server...")
+        await asyncio.sleep(1)
+        thread_pool.shutdown(wait=True)
+        storage.clear()
+        logger.info("Server shutdown complete")
 
+# 创建FastAPI应用
 app = FastAPI(
     title="对象存储服务",
-    description="轻量级本地对象存储HTTP服务",
-    openapi_url="/objsave/openapi.json",
+    description="企业级对象存储服务",
+    version="1.0.0",
     docs_url="/objsave/docs",
     redoc_url="/objsave/redoc",
     lifespan=lifespan
@@ -76,12 +98,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # 创建路由前缀
 api_router = APIRouter(prefix="/objsave")
-
-# 初始化数据库
-init_db()
 
 # 对象元数据模型
 class ObjectMetadata(BaseModel):
@@ -90,6 +110,7 @@ class ObjectMetadata(BaseModel):
     content_type: str
     size: int
     created_at: str
+    owner: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -120,170 +141,260 @@ class JSONObjectResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+# 安全中间件
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    try:
+        # 获取客户端IP
+        client_ip = request.client.host
+        
+        # 验证请求数据
+        if request.method in ["POST", "PUT"]:
+            try:
+                body = await request.json()
+                if not security.validate_request_data(body):
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": "Invalid request data"}
+                    )
+            except:
+                pass  # 非JSON请求体，跳过验证
+                
+        response = await call_next(request)
+        return response
+        
+    except Exception as e:
+        logger.error(f"Security middleware error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"}
+        )
+
 # 性能监控中间件
 @app.middleware("http")
 async def performance_middleware(request: Request, call_next):
-    """性能监控中间件"""
-    start_time = time.time()
-    # 检查系统资源
-    can_process, error_message = resource_manager.check_resources()
-    if not can_process:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": error_message}
-        )
-    
-    # 并发限制
-    if len(asyncio.all_tasks()) > MAX_CONCURRENT_REQUESTS:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "服务器繁忙，请稍后重试"}
-        )
-    
     try:
+        start_time = time.time()
+        
+        # 检查系统负载
+        cache_stats = cache.get_stats()
+        if float(cache_stats['capacity_usage'].rstrip('%')) > 90:
+            logger.warning(f"High cache usage: {cache_stats['capacity_usage']}")
+            storage_stats = storage.get_stats()
+            logger.info(f"Storage stats: {storage_stats}")
+            
         response = await call_next(request)
-        duration = time.time() - start_time
-        # 添加性能指标到响应头
-        response.headers["X-Process-Time"] = str(duration)
-        response.headers["X-Cache-Stats"] = str(cache.get_stats())
+        process_time = time.time() - start_time
+        
+        # 添加性能指标
+        response.headers["X-Process-Time"] = str(process_time)
         
         # 记录慢请求
-        if duration > 1.0:
-            logger.warning(f"Slow request: {request.url} took {duration:.2f}s")
-        
+        if process_time > 1.0:
+            logger.warning(f"Slow request: {request.url.path} took {process_time:.2f}s")
+            
         return response
     except Exception as e:
-        duration = time.time() - start_time
-        logger.error(f"Error during request: {str(e)}")
-        raise e
+        logger.error(f"Performance middleware error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"}
+        )
 
-# 全局错误处理
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Global error: {str(exc)}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"}
-    )
+# 认证依赖
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security_bearer)
+) -> Dict:
+    token = credentials.credentials
+    payload = security.verify_token(token)
+    if not payload:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return payload
+
+# 权限检查装饰器
+def require_permission(permission: str):
+    def decorator(func):
+        async def wrapper(*args, user: Dict = Depends(get_current_user), **kwargs):
+            if not security.has_permission(user.get("role", ""), permission):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Not enough permissions"
+                )
+            return await func(*args, user=user, **kwargs)
+        return wrapper
+    return decorator
 
 # 健康检查接口
-@api_router.get("/health")
+@app.get("/health")
 async def health_check():
     """系统健康检查"""
-    resources = resource_manager.get_system_resources()
-    cache_stats = cache.get_stats()
-    
-    return {
-        "status": "healthy",
-        "system_resources": resources,
-        "cache_stats": cache_stats,
-        "worker_count": thread_pool._max_workers,
-        "current_tasks": len(asyncio.all_tasks())
-    }
+    try:
+        cache_stats = cache.get_stats()
+        storage_stats = storage.get_stats()
+        queue_stats = request_queue.get_stats()
+        security_stats = security.get_stats()
+        
+        return {
+            "status": "healthy",
+            "cache": cache_stats,
+            "storage": storage_stats,
+            "queue": queue_stats,
+            "security": security_stats,
+            "system": {
+                "workers": MAX_WORKERS
+            }
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Health check failed")
 
 # 上传对象接口
-@api_router.post("/upload", response_model=ObjectMetadata)
+@app.post("/upload")
+@require_permission("write")
 async def upload_object(
-    file: UploadFile = File(...), 
-    db: Session = Depends(get_db)
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: Dict = Depends(get_current_user)
 ):
     """上传对象到存储服务"""
     try:
-        # 文件大小限制检查
-        MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
-        content = await file.read(MAX_FILE_SIZE + 1)
-        if len(content) > MAX_FILE_SIZE:
+        # 检查文件大小
+        if file.size and file.size > MAX_UPLOAD_SIZE:
             raise HTTPException(status_code=413, detail="File too large")
             
-        # 创建新的存储对象
-        db_object = ObjectStorage(
-            id=str(uuid.uuid4()),
-            name=file.filename,
-            content=content,
-            content_type=file.content_type,
-            size=len(content)
-        )
+        content = await file.read()
         
-        # 使用线程池处理数据库操作
-        def db_operation():
-            try:
-                db.add(db_object)
-                db.commit()
-                db.refresh(db_object)
-                return db_object
-            except Exception as e:
-                db.rollback()
-                raise e
-
-        db_object = await asyncio.get_event_loop().run_in_executor(
-            thread_pool, 
-            db_operation
-        )
-        
-        # 创建响应对象
-        metadata = ObjectMetadata(
-            id=db_object.id,
-            name=db_object.name,
-            content_type=db_object.content_type,
-            size=db_object.size,
-            created_at=str(db_object.created_at)
-        )
-        
-        # 缓存元数据
-        cache.set(f"metadata:{db_object.id}", metadata.dict())
-        
-        return metadata
-    
-    except Exception as e:
-        logger.error(f"Failed to upload file {file.filename}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"上传失败: {str(e)}")
-
-# 下载对象接口
-@api_router.get("/download/{object_id}")
-async def download_object(
-    object_id: str, 
-    db: Session = Depends(get_db)
-):
-    """下载指定对象"""
-    try:
-        # 先从缓存获取
-        cached_data = cache.get(f"content:{object_id}")
-        if cached_data:
-            logger.debug(f"Cache hit for object_id: {object_id}")
-            return cached_data
+        # 将上传任务加入队列
+        async def upload_task():
+            object_id = str(uuid.uuid4())
             
-        # 缓存未命中，从数据库获取
-        def db_operation():
-            return db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
+            # 尝试存储到缓存
+            cache_stats = cache.get_stats()
+            if float(cache_stats['capacity_usage'].rstrip('%')) <= 90:
+                cache.set(object_id, content)
+                storage_type = "cache"
+            else:
+                storage.set(object_id, content)
+                storage_type = "storage"
+                
+            metadata = ObjectMetadata(
+                id=object_id,
+                name=file.filename,
+                content_type=file.content_type,
+                size=len(content),
+                created_at=datetime.now().isoformat(),
+                owner=user["user_id"]
+            )
             
-        db_object = await asyncio.get_event_loop().run_in_executor(
-            thread_pool, 
-            db_operation
+            # 存储元数据到数据库
+            db_obj = ObjectStorage(
+                id=metadata.id,
+                name=metadata.name,
+                content_type=metadata.content_type,
+                size=metadata.size,
+                created_at=metadata.created_at,
+                owner=metadata.owner
+            )
+            
+            db.add(db_obj)
+            db.commit()
+            
+            logger.info(f"Object {object_id} uploaded by {user['user_id']} using {storage_type}")
+            return metadata
+            
+        # 将任务加入队列，优先处理小文件
+        priority = 0 if len(content) < 1024 * 1024 else 1  # 1MB以下的文件优先处理
+        task_id = await request_queue.enqueue(
+            upload_task,
+            priority=priority,
+            is_cpu_bound=len(content) > 5 * 1024 * 1024  # 5MB以上的文件使用线程池处理
         )
         
-        if not db_object:
-            raise HTTPException(status_code=404, detail="对象未找到")
-        
-        response_data = {
-            "file_name": db_object.name,
-            "content_type": db_object.content_type,
-            "content": db_object.content,
-            "type": db_object.type
-        }
-        
-        # 缓存响应数据
-        cache.set(f"content:{object_id}", response_data)
-        
-        return response_data
-        
+        # 等待结果
+        while True:
+            result = request_queue.get_result(task_id)
+            if result:
+                if result["status"] == "completed":
+                    return result["result"]
+                elif result["status"] == "failed":
+                    raise HTTPException(status_code=500, detail=result["error"])
+            await asyncio.sleep(0.1)
+            
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error downloading object {object_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"下载失败: {str(e)}")
+        logger.error(f"Upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Upload failed")
+
+# 下载对象接口
+@app.get("/download/{object_id}")
+@require_permission("read")
+async def download_object(
+    object_id: str,
+    db: Session = Depends(get_db),
+    user: Dict = Depends(get_current_user)
+):
+    """下载指定对象"""
+    try:
+        async def download_task():
+            db_obj = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
+            if not db_obj:
+                raise HTTPException(status_code=404, detail="Object not found")
+                
+            # 检查权限
+            if db_obj.owner != user["user_id"] and user["role"] != "admin":
+                raise HTTPException(status_code=403, detail="Not authorized to access this object")
+                
+            # 尝试从缓存获取
+            content = cache.get(object_id)
+            if content is None:
+                content = storage.get(object_id)
+                if content is None:
+                    raise HTTPException(status_code=404, detail="Object content not found")
+                    
+            return {
+                "content": content,
+                "media_type": db_obj.content_type,
+                "filename": db_obj.name
+            }
+            
+        # 将下载任务加入队列
+        task_id = await request_queue.enqueue(
+            download_task,
+            priority=0,  # 下载请求优先处理
+            is_cpu_bound=False
+        )
+        
+        # 等待结果
+        while True:
+            result = request_queue.get_result(task_id)
+            if result:
+                if result["status"] == "completed":
+                    data = result["result"]
+                    return Response(
+                        content=data["content"],
+                        media_type=data["media_type"],
+                        headers={
+                            "Content-Disposition": f'attachment; filename="{data["filename"]}"',
+                            "Cache-Control": "max-age=3600"
+                        }
+                    )
+                elif result["status"] == "failed":
+                    raise HTTPException(status_code=500, detail=result["error"])
+            await asyncio.sleep(0.1)
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Download failed")
 
 # 列出所有对象接口
-@api_router.get("/list", response_model=List[ObjectMetadata])
+@app.get("/list", response_model=List[ObjectMetadata])
 async def list_objects(
     db: Session = Depends(get_db),
     limit: Optional[int] = 100,
@@ -314,7 +425,8 @@ async def list_objects(
                 name=obj.name,
                 content_type=obj.content_type,
                 size=obj.size,
-                created_at=str(obj.created_at)
+                created_at=str(obj.created_at),
+                owner=obj.owner
             ) for obj in objects
         ]
         
@@ -328,7 +440,7 @@ async def list_objects(
         raise HTTPException(status_code=500, detail=f"获取列表失败: {str(e)}")
 
 # JSON对象上传接口
-@api_router.post("/upload/json", response_model=ObjectMetadata)
+@app.post("/upload/json", response_model=ObjectMetadata)
 async def upload_json_object(
     json_data: JSONObjectModel, 
     db: Session = Depends(get_db)
@@ -387,7 +499,7 @@ async def upload_json_object(
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象批量上传接口
-@api_router.post("/upload/json/batch", response_model=List[ObjectMetadata])
+@app.post("/upload/json/batch", response_model=List[ObjectMetadata])
 async def upload_json_objects_batch(
     json_objects: List[JSONObjectModel], 
     db: Session = Depends(get_db)
@@ -447,7 +559,7 @@ async def upload_json_objects_batch(
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象更新接口
-@api_router.put("/update/json/{object_id}", response_model=ObjectMetadata)
+@app.put("/update/json/{object_id}", response_model=ObjectMetadata)
 async def update_json_object(
     object_id: str,
     json_data: JSONObjectModel, 
@@ -512,7 +624,7 @@ async def update_json_object(
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象查询接口
-@api_router.post("/query/json", response_model=List[JSONObjectResponse])
+@app.post("/query/json", response_model=List[JSONObjectResponse])
 async def query_json_objects(
     query: JSONQueryModel, 
     db: Session = Depends(get_db),

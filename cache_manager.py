@@ -39,6 +39,7 @@ class CacheManager:
     - 分片存储
     """
     def __init__(self, max_items: int = 10000, shards: int = 8):
+        self._max_items = max_items
         self._shards = [
             {
                 'cache': LRUCache(max_items // shards),
@@ -50,9 +51,12 @@ class CacheManager:
         self._stats = {
             'hits': 0,
             'misses': 0,
-            'evictions': 0
+            'evictions': 0,
+            'total_capacity': max_items,
+            'shard_capacity': max_items // shards
         }
         self._stats_lock = Lock()
+        logger.info(f"Cache initialized with {max_items} max items across {shards} shards")
         
     def _get_shard(self, key: str) -> dict:
         """获取key对应的分片"""
@@ -61,38 +65,52 @@ class CacheManager:
         
     def get(self, key: str) -> Optional[Any]:
         """获取缓存值"""
-        shard = self._get_shard(key)
-        with shard['lock']:
-            value = shard['cache'].get(key)
-            if value is None:
+        try:
+            shard = self._get_shard(key)
+            with shard['lock']:
+                value = shard['cache'].get(key)
+                if value is None:
+                    with self._stats_lock:
+                        self._stats['misses'] += 1
+                    return None
+                    
+                metadata = shard['metadata'].get(key)
+                if metadata and metadata['expire_at'] < datetime.now():
+                    # 已过期
+                    shard['cache'].cache.pop(key)
+                    shard['metadata'].pop(key)
+                    with self._stats_lock:
+                        self._stats['evictions'] += 1
+                        self._stats['misses'] += 1
+                    return None
+                    
                 with self._stats_lock:
-                    self._stats['misses'] += 1
-                return None
-                
-            metadata = shard['metadata'].get(key)
-            if metadata and metadata['expire_at'] < datetime.now():
-                # 已过期
-                shard['cache'].cache.pop(key)
-                shard['metadata'].pop(key)
-                with self._stats_lock:
-                    self._stats['evictions'] += 1
-                    self._stats['misses'] += 1
-                return None
-                
-            with self._stats_lock:
-                self._stats['hits'] += 1
-            return value
+                    self._stats['hits'] += 1
+                return value
+        except Exception as e:
+            logger.error(f"Error getting cache key {key}: {str(e)}")
+            return None
             
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         """设置缓存值"""
-        shard = self._get_shard(key)
-        with shard['lock']:
-            shard['cache'].put(key, value)
-            if ttl:
-                shard['metadata'][key] = {
-                    'expire_at': datetime.now() + timedelta(seconds=ttl)
-                }
+        try:
+            shard = self._get_shard(key)
+            with shard['lock']:
+                current_size = len(shard['cache'].cache)
+                if current_size >= shard['cache'].capacity:
+                    # 如果分片已满，记录统计并继续（LRU会自动移除最旧项）
+                    with self._stats_lock:
+                        self._stats['evictions'] += 1
+                    logger.warning(f"Cache shard at capacity ({current_size}/{shard['cache'].capacity})")
                 
+                shard['cache'].put(key, value)
+                if ttl:
+                    shard['metadata'][key] = {
+                        'expire_at': datetime.now() + timedelta(seconds=ttl)
+                    }
+        except Exception as e:
+            logger.error(f"Error setting cache key {key}: {str(e)}")
+            
     def delete(self, key: str) -> None:
         """删除缓存值"""
         shard = self._get_shard(key)
@@ -112,10 +130,20 @@ class CacheManager:
         """获取缓存统计信息"""
         with self._stats_lock:
             total_items = sum(len(shard['cache'].cache) for shard in self._shards)
-            return {
+            capacity_usage = total_items / self._max_items * 100
+            
+            stats = {
                 'total_items': total_items,
+                'capacity_usage': f"{capacity_usage:.1f}%",
+                'max_items': self._max_items,
                 'hits': self._stats['hits'],
                 'misses': self._stats['misses'],
                 'hit_ratio': self._stats['hits'] / (self._stats['hits'] + self._stats['misses']) if (self._stats['hits'] + self._stats['misses']) > 0 else 0,
                 'evictions': self._stats['evictions']
             }
+            
+            # 当使用率超过90%时记录警告
+            if capacity_usage > 90:
+                logger.warning(f"Cache usage high: {capacity_usage:.1f}%")
+                
+            return stats
