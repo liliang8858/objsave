@@ -111,6 +111,8 @@ class JSONObjectResponse(BaseModel):
 # 性能监控中间件
 @app.middleware("http")
 async def performance_middleware(request: Request, call_next):
+    """性能监控中间件"""
+    start_time = time.time()
     # 检查系统资源
     can_process, error_message = resource_manager.check_resources()
     if not can_process:
@@ -126,20 +128,22 @@ async def performance_middleware(request: Request, call_next):
             content={"detail": "服务器繁忙，请稍后重试"}
         )
     
-    # 记录处理时间
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    
-    # 添加性能指标到响应头
-    response.headers["X-Process-Time"] = str(process_time)
-    response.headers["X-Cache-Stats"] = str(cache.get_stats())
-    
-    # 记录慢请求
-    if process_time > 1.0:
-        logger.warning(f"Slow request: {request.url} took {process_time:.2f}s")
-    
-    return response
+    try:
+        response = await call_next(request)
+        duration = time.time() - start_time
+        # 添加性能指标到响应头
+        response.headers["X-Process-Time"] = str(duration)
+        response.headers["X-Cache-Stats"] = str(cache.get_stats())
+        
+        # 记录慢请求
+        if duration > 1.0:
+            logger.warning(f"Slow request: {request.url} took {duration:.2f}s")
+        
+        return response
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error(f"Error during request: {str(e)}")
+        raise e
 
 # 全局错误处理
 @app.exception_handler(Exception)
