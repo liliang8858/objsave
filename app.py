@@ -777,18 +777,11 @@ app.include_router(api_router)
 # 启动服务器配置
 if __name__ == "__main__":
     import uvicorn
-    
-    # 获取CPU核心数
-    workers = min(multiprocessing.cpu_count(), 4)
-    
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
         port=8000,
-        workers=workers,
-        limit_concurrency=1000,
-        limit_max_requests=10000,
-        timeout_keep_alive=5,
-        log_level="warning",
-        reload=True
+        reload=True,
+        workers=1,  # 开发模式使用单进程
+        log_level="info"
     )
