@@ -1,24 +1,51 @@
 import os
 import uuid
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, APIRouter
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
 import json
 import jsonpath
 import logging
 from datetime import datetime
+import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 from db import init_db, get_db, ObjectStorage
+from cache_manager import CacheManager
+from resource_manager import ResourceManager
 
 # 配置日志记录
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,  # 生产环境推荐INFO级别
     format='%(asctime)s - %(levelname)s - [%(pathname)s:%(lineno)d] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# 系统配置
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_CONCURRENT_REQUESTS = 500
+CHUNK_SIZE = 8192  # 8KB
+
+# 创建资源管理器
+resource_manager = ResourceManager()
+
+# 创建缓存管理器实例
+cache = CacheManager(
+    max_size=10000,
+    default_ttl=3600,
+    max_memory_mb=int(resource_manager.get_memory_limit() / (1024 * 1024))
+)
+
+# 创建线程池
+thread_pool = ThreadPoolExecutor(
+    max_workers=resource_manager.get_available_workers()
+)
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -32,10 +59,10 @@ app = FastAPI(
 # 配置CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有源
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # 允许所有HTTP方法
-    allow_headers=["*"],  # 允许所有请求头
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 创建路由前缀
@@ -81,23 +108,77 @@ class JSONObjectResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+# 性能监控中间件
+@app.middleware("http")
+async def performance_middleware(request: Request, call_next):
+    # 检查系统资源
+    can_process, error_message = resource_manager.check_resources()
+    if not can_process:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": error_message}
+        )
+    
+    # 并发限制
+    if len(asyncio.all_tasks()) > MAX_CONCURRENT_REQUESTS:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "服务器繁忙，请稍后重试"}
+        )
+    
+    # 记录处理时间
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    
+    # 添加性能指标到响应头
+    response.headers["X-Process-Time"] = str(process_time)
+    response.headers["X-Cache-Stats"] = str(cache.get_stats())
+    
+    # 记录慢请求
+    if process_time > 1.0:
+        logger.warning(f"Slow request: {request.url} took {process_time:.2f}s")
+    
+    return response
+
+# 全局错误处理
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Global error: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"}
+    )
+
+# 健康检查接口
+@api_router.get("/health")
+async def health_check():
+    """系统健康检查"""
+    resources = resource_manager.get_system_resources()
+    cache_stats = cache.get_stats()
+    
+    return {
+        "status": "healthy",
+        "system_resources": resources,
+        "cache_stats": cache_stats,
+        "worker_count": thread_pool._max_workers,
+        "current_tasks": len(asyncio.all_tasks())
+    }
+
 # 上传对象接口
 @api_router.post("/upload", response_model=ObjectMetadata)
 async def upload_object(
     file: UploadFile = File(...), 
     db: Session = Depends(get_db)
 ):
-    """
-    上传对象到存储服务
-    
-    - 接受任意类型和大小的文件
-    - 使用UUID生成唯一标识符
-    - 存储文件内容和元数据
-    """
+    """上传对象到存储服务"""
     try:
-        # 读取文件内容
-        content = await file.read()
-        
+        # 文件大小限制检查
+        MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+        content = await file.read(MAX_FILE_SIZE + 1)
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=413, detail="File too large")
+            
         # 创建新的存储对象
         db_object = ObjectStorage(
             id=str(uuid.uuid4()),
@@ -107,22 +188,35 @@ async def upload_object(
             size=len(content)
         )
         
-        logger.debug(f"Uploading file: {file.filename} (size: {len(content)} bytes, type: {file.content_type})")
+        # 使用线程池处理数据库操作
+        def db_operation():
+            try:
+                db.add(db_object)
+                db.commit()
+                db.refresh(db_object)
+                return db_object
+            except Exception as e:
+                db.rollback()
+                raise e
+
+        db_object = await asyncio.get_event_loop().run_in_executor(
+            thread_pool, 
+            db_operation
+        )
         
-        # 保存到数据库
-        db.add(db_object)
-        db.commit()
-        db.refresh(db_object)
-        
-        logger.info(f"Successfully uploaded file: {file.filename} with ID: {db_object.id}")
-        
-        return ObjectMetadata(
+        # 创建响应对象
+        metadata = ObjectMetadata(
             id=db_object.id,
             name=db_object.name,
             content_type=db_object.content_type,
             size=db_object.size,
             created_at=str(db_object.created_at)
         )
+        
+        # 缓存元数据
+        cache.set(f"metadata:{db_object.id}", metadata.dict())
+        
+        return metadata
     
     except Exception as e:
         logger.error(f"Failed to upload file {file.filename}: {str(e)}")
@@ -134,91 +228,88 @@ async def download_object(
     object_id: str, 
     db: Session = Depends(get_db)
 ):
-    """
-    根据对象ID下载文件
-    
-    - 返回完整的文件内容
-    - 如果对象不存在，返回404错误
-    """
-    logger.debug(f"Attempting to download object with ID: {object_id}")
-    
-    db_object = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
-    
-    if not db_object:
-        logger.warning(f"Object not found with ID: {object_id}")
-        raise HTTPException(status_code=404, detail="对象未找到")
-    
-    logger.info(f"Successfully retrieved object: {db_object.name} (ID: {object_id})")
-    
-    response_data = {
-        "file_name": db_object.name,
-        "content_type": db_object.content_type,
-        "content": db_object.content,
-        "type": db_object.type
-    }
-    
-    # 如果是JSON对象，添加type字段
-    if db_object.content_type == "application/json":
-        try:
-            json_content = json.loads(db_object.content)
-            if "type" in json_content:
-                response_data["type"] = json_content["type"]
-        except json.JSONDecodeError:
-            logger.warning(f"Failed to parse JSON content for object ID: {object_id}")
-    
-    return response_data
+    """下载指定对象"""
+    try:
+        # 先从缓存获取
+        cached_data = cache.get(f"content:{object_id}")
+        if cached_data:
+            logger.debug(f"Cache hit for object_id: {object_id}")
+            return cached_data
+            
+        # 缓存未命中，从数据库获取
+        def db_operation():
+            return db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
+            
+        db_object = await asyncio.get_event_loop().run_in_executor(
+            thread_pool, 
+            db_operation
+        )
+        
+        if not db_object:
+            raise HTTPException(status_code=404, detail="对象未找到")
+        
+        response_data = {
+            "file_name": db_object.name,
+            "content_type": db_object.content_type,
+            "content": db_object.content,
+            "type": db_object.type
+        }
+        
+        # 缓存响应数据
+        cache.set(f"content:{object_id}", response_data)
+        
+        return response_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading object {object_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"下载失败: {str(e)}")
 
 # 列出所有对象接口
 @api_router.get("/list", response_model=List[ObjectMetadata])
 async def list_objects(
     db: Session = Depends(get_db),
     limit: Optional[int] = 100,
-    offset: Optional[int] = 0
+    offset: Optional[int] = 0,
+    last_id: Optional[str] = None  # 游标分页
 ):
-    """
-    列出存储的对象
-    
-    - 支持分页
-    - 默认返回前100个对象
-    """
-    objects = db.query(ObjectStorage).offset(offset).limit(limit).all()
-    
-    return [
-        ObjectMetadata(
-            id=obj.id,
-            name=obj.name,
-            content_type=obj.content_type,
-            size=obj.size,
-            created_at=str(obj.created_at)
-        ) for obj in objects
-    ]
-
-# 删除对象接口
-@api_router.delete("/delete/{object_id}")
-async def delete_object(
-    object_id: str, 
-    db: Session = Depends(get_db)
-):
-    """
-    根据对象ID删除文件
-    
-    - 如果对象不存在，返回404错误
-    """
-    logger.debug(f"Attempting to delete object with ID: {object_id}")
-    
-    db_object = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
-    
-    if not db_object:
-        logger.warning(f"Object not found with ID: {object_id}")
-        raise HTTPException(status_code=404, detail="对象未找到")
-    
-    object_name = db_object.name
-    db.delete(db_object)
-    db.commit()
-    
-    logger.info(f"Successfully deleted object: {object_name} (ID: {object_id})")
-    
-    return {"message": "对象删除成功"}
+    """列出存储的对象"""
+    try:
+        cache_key = f"list:last_id={last_id}:limit={limit}:offset={offset}"
+        cached_data = cache.get(cache_key)
+        if cached_data:
+            return cached_data
+            
+        def db_operation():
+            query = db.query(ObjectStorage)
+            if last_id:
+                query = query.filter(ObjectStorage.id > last_id)
+            return query.offset(offset).limit(limit).all()
+            
+        objects = await asyncio.get_event_loop().run_in_executor(
+            thread_pool, 
+            db_operation
+        )
+        
+        result = [
+            ObjectMetadata(
+                id=obj.id,
+                name=obj.name,
+                content_type=obj.content_type,
+                size=obj.size,
+                created_at=str(obj.created_at)
+            ) for obj in objects
+        ]
+        
+        # 缓存结果，设置较短的TTL
+        cache.set(cache_key, result, ttl=60)  # 缓存1分钟
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error listing objects: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"获取列表失败: {str(e)}")
 
 # JSON对象上传接口
 @api_router.post("/upload/json", response_model=ObjectMetadata)
@@ -226,44 +317,56 @@ async def upload_json_object(
     json_data: JSONObjectModel, 
     db: Session = Depends(get_db)
 ):
-    """
-    上传JSON对象到存储服务
-    
-    - 使用UUID生成唯一标识符
-    - 存储JSON内容和元数据
-    """
+    """上传JSON对象"""
     try:
-        # 检查并转换输入数据
-        if isinstance(json_data, dict):
-            json_data = JSONObjectModel(**json_data)
-        
         content_str = json.dumps(json_data.content)
-        
-        # 生成唯一ID
+        if len(content_str.encode('utf-8')) > 10 * 1024 * 1024:  # 10MB限制
+            raise HTTPException(status_code=413, detail="JSON content too large")
+            
         object_id = str(uuid.uuid4())
-        
-        # 获取当前时间
         current_time = datetime.now().isoformat()
         
-        # 创建对象存储记录
-        obj = ObjectStorage(
-            id=object_id,  # 使用生成的UUID
-            name=json_data.name if hasattr(json_data, 'name') else object_id,
-            content=content_str,
-            content_type='application/json',
-            type=json_data.type,
-            size=len(content_str),
-            created_at=current_time
+        def db_operation():
+            try:
+                obj = ObjectStorage(
+                    id=object_id,
+                    name=json_data.name or object_id,
+                    content=content_str,
+                    content_type='application/json',
+                    type=json_data.type,
+                    size=len(content_str),
+                    created_at=current_time
+                )
+                db.add(obj)
+                db.commit()
+                db.refresh(obj)
+                return obj
+            except Exception as e:
+                db.rollback()
+                raise e
+                
+        db_object = await asyncio.get_event_loop().run_in_executor(
+            thread_pool, 
+            db_operation
         )
         
-        # 保存到数据库
-        db.add(obj)
-        db.commit()
-        db.refresh(obj)
+        metadata = ObjectMetadata(
+            id=db_object.id,
+            name=db_object.name,
+            content_type=db_object.content_type,
+            size=db_object.size,
+            created_at=str(db_object.created_at)
+        )
         
-        return obj
+        # 缓存元数据和内容
+        cache.set(f"metadata:{db_object.id}", metadata.dict())
+        cache.set(f"content:{db_object.id}", json_data.content)
+        
+        return metadata
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        db.rollback()
         logger.error(f"Failed to upload JSON object: {str(e)}")
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -273,12 +376,7 @@ async def upload_json_objects_batch(
     json_objects: List[JSONObjectModel], 
     db: Session = Depends(get_db)
 ):
-    """
-    批量上传JSON对象到存储服务
-    
-    - 支持一次性上传多个JSON对象
-    - 每个对象使用UUID生成唯一标识符
-    """
+    """批量上传JSON对象"""
     try:
         # 存储所有对象并收集元数据
         metadata_list = []
@@ -300,8 +398,19 @@ async def upload_json_objects_batch(
             db_objects.append(db_object)
         
         # 保存到数据库
-        db.add_all(db_objects)
-        db.commit()
+        def db_operation():
+            try:
+                db.add_all(db_objects)
+                db.commit()
+                return db_objects
+            except Exception as e:
+                db.rollback()
+                raise e
+
+        db_objects = await asyncio.get_event_loop().run_in_executor(
+            thread_pool, 
+            db_operation
+        )
         
         for db_object in db_objects:
             metadata_list.append(ObjectMetadata(
@@ -312,7 +421,12 @@ async def upload_json_objects_batch(
                 created_at=str(db_object.created_at)
             ))
         
+        # 缓存元数据
+        for metadata in metadata_list:
+            cache.set(f"metadata:{metadata.id}", metadata.dict())
+        
         return metadata_list
+    
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -323,15 +437,16 @@ async def update_json_object(
     json_data: JSONObjectModel, 
     db: Session = Depends(get_db)
 ):
-    """
-    更新指定ID的JSON对象
-    
-    - 根据对象ID更新JSON内容
-    - 如果对象不存在，返回404错误
-    """
+    """更新指定ID的JSON对象"""
     try:
         # 查找现有对象
-        db_object = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
+        def db_operation():
+            return db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
+            
+        db_object = await asyncio.get_event_loop().run_in_executor(
+            thread_pool, 
+            db_operation
+        )
         
         if not db_object:
             raise HTTPException(status_code=404, detail="对象未找到")
@@ -345,8 +460,29 @@ async def update_json_object(
         db_object.size = len(content)
         
         # 提交更改
-        db.commit()
-        db.refresh(db_object)
+        def db_operation():
+            try:
+                db.commit()
+                db.refresh(db_object)
+                return db_object
+            except Exception as e:
+                db.rollback()
+                raise e
+
+        db_object = await asyncio.get_event_loop().run_in_executor(
+            thread_pool, 
+            db_operation
+        )
+        
+        # 缓存元数据和内容
+        cache.set(f"metadata:{db_object.id}", ObjectMetadata(
+            id=db_object.id,
+            name=db_object.name,
+            content_type=db_object.content_type,
+            size=db_object.size,
+            created_at=str(db_object.created_at)
+        ).dict())
+        cache.set(f"content:{db_object.id}", json_data.content)
         
         return ObjectMetadata(
             id=db_object.id,
@@ -355,6 +491,7 @@ async def update_json_object(
             size=db_object.size,
             created_at=str(db_object.created_at)
         )
+    
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -366,24 +503,7 @@ async def query_json_objects(
     limit: Optional[int] = 100,
     offset: Optional[int] = 0
 ):
-    """
-    根据 JSONPath 查询和过滤 JSON 对象
-    
-    支持的操作:
-    - 精确匹配 (eq)
-    - 大于 (gt)
-    - 小于 (lt)
-    - 大于等于 (ge)
-    - 小于等于 (le)
-    - 包含 (contains)
-    
-    JSONPath 示例:
-    - $.name                     (查询根级别的 name 字段)
-    - $.address.city            (查询嵌套的 city 字段)
-    - $.items[*]               (查询数组中的所有项)
-    - $.*.name                 (查询任意层级下的 name 字段)
-    - $.data[?(@.type=="idea")] (查询 data 数组中 type 为 "idea" 的项)
-    """
+    """根据 JSONPath 查询和过滤 JSON 对象"""
     try:
         logger.debug(f"Querying JSON objects with path: {query.jsonpath}, value: {query.value}, operator: {query.operator}")
         
@@ -421,7 +541,13 @@ async def query_json_objects(
         logger.debug(f"SQL Query: {base_query.statement}")
             
         # 执行分页查询    
-        objects = base_query.offset(offset).limit(limit).all()
+        def db_operation():
+            return base_query.offset(offset).limit(limit).all()
+            
+        objects = await asyncio.get_event_loop().run_in_executor(
+            thread_pool, 
+            db_operation
+        )
         
         # 打印查询到的对象
         logger.debug("Query results:")
@@ -517,10 +643,38 @@ def _apply_filter(value, compare_value, operator):
     except TypeError:
         return False
 
+# 启动事件处理
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Starting up server...")
+    logger.info(f"Available workers: {thread_pool._max_workers}")
+    logger.info(f"Memory limit: {cache._max_memory / (1024*1024):.2f}MB")
+    logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
+
+# 关闭事件处理
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down server...")
+    thread_pool.shutdown(wait=True)
+    cache.clear()
+
 # 将路由添加到主应用
 app.include_router(api_router)
 
 # 启动服务器配置
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    # 获取CPU核心数
+    workers = min(multiprocessing.cpu_count(), 4)
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        workers=workers,
+        limit_concurrency=1000,
+        limit_max_requests=10000,
+        timeout_keep_alive=5,
+        log_level="warning"
+    )
