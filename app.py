@@ -37,7 +37,8 @@ resource_manager = ResourceManager()
 
 # 创建缓存管理器实例
 cache = CacheManager(
-    max_size=10000,
+    max_items=10000,
+    shards=8,
     default_ttl=3600,
     max_memory_mb=int(resource_manager.get_memory_limit() / (1024 * 1024))
 )
