@@ -1,7 +1,7 @@
 import os
 import uuid
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
@@ -21,7 +21,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 创建FastAPI应用
-app = FastAPI(title="对象存储服务", description="轻量级本地对象存储HTTP服务")
+app = FastAPI(
+    title="对象存储服务",
+    description="轻量级本地对象存储HTTP服务",
+    openapi_url="/objsave/openapi.json",
+    docs_url="/objsave/docs",
+    redoc_url="/objsave/redoc"
+)
 
 # 配置CORS
 app.add_middleware(
@@ -31,6 +37,9 @@ app.add_middleware(
     allow_methods=["*"],  # 允许所有HTTP方法
     allow_headers=["*"],  # 允许所有请求头
 )
+
+# 创建路由前缀
+api_router = APIRouter(prefix="/objsave")
 
 # 初始化数据库
 init_db()
@@ -73,7 +82,7 @@ class JSONObjectResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 # 上传对象接口
-@app.post("/upload", response_model=ObjectMetadata)
+@api_router.post("/upload", response_model=ObjectMetadata)
 async def upload_object(
     file: UploadFile = File(...), 
     db: Session = Depends(get_db)
@@ -120,7 +129,7 @@ async def upload_object(
         raise HTTPException(status_code=500, detail=f"上传失败: {str(e)}")
 
 # 下载对象接口
-@app.get("/download/{object_id}")
+@api_router.get("/download/{object_id}")
 async def download_object(
     object_id: str, 
     db: Session = Depends(get_db)
@@ -160,7 +169,7 @@ async def download_object(
     return response_data
 
 # 列出所有对象接口
-@app.get("/list", response_model=List[ObjectMetadata])
+@api_router.get("/list", response_model=List[ObjectMetadata])
 async def list_objects(
     db: Session = Depends(get_db),
     limit: Optional[int] = 100,
@@ -185,7 +194,7 @@ async def list_objects(
     ]
 
 # 删除对象接口
-@app.delete("/delete/{object_id}")
+@api_router.delete("/delete/{object_id}")
 async def delete_object(
     object_id: str, 
     db: Session = Depends(get_db)
@@ -212,7 +221,7 @@ async def delete_object(
     return {"message": "对象删除成功"}
 
 # JSON对象上传接口
-@app.post("/upload/json", response_model=ObjectMetadata)
+@api_router.post("/upload/json", response_model=ObjectMetadata)
 async def upload_json_object(
     json_data: JSONObjectModel, 
     db: Session = Depends(get_db)
@@ -224,43 +233,40 @@ async def upload_json_object(
     - 存储JSON内容和元数据
     """
     try:
-        # 序列化JSON数据
-        content = json.dumps(json_data.content, ensure_ascii=False).encode('utf-8')
+        # 生成唯一ID
+        object_id = str(uuid.uuid4())
         
-        logger.debug(f"Uploading JSON object: {json_data.name or 'untitled.json'} (size: {len(content)} bytes)")
-        logger.debug(f"JSON content: {json_data.content}")
-        logger.debug(f"JSON type: {json_data.type}")
+        # 转换JSON数据为字符串
+        json_content = json_data.content.model_dump() if hasattr(json_data, 'content') else {}
+        content_str = json.dumps(json_content, ensure_ascii=False)
         
-        # 创建新的存储对象
-        db_object = ObjectStorage(
-            id=json_data.id or str(uuid.uuid4()),
-            name=json_data.name or "untitled.json",
-            content=content,
-            content_type="application/json",
-            type=json_data.type,  # 设置type字段
-            size=len(content)
+        # 获取当前时间
+        current_time = datetime.now().isoformat()
+        
+        # 创建对象存储记录
+        obj = ObjectStorage(
+            id=object_id,  # 使用生成的UUID
+            name=json_data.name if hasattr(json_data, 'name') else object_id,
+            content=content_str,
+            content_type='application/json',
+            type=json_data.type,
+            size=len(content_str),
+            created_at=current_time
         )
         
         # 保存到数据库
-        db.add(db_object)
+        db.add(obj)
         db.commit()
-        db.refresh(db_object)
+        db.refresh(obj)
         
-        logger.info(f"Successfully uploaded JSON object: {db_object.name} with ID: {db_object.id}")
-        
-        return ObjectMetadata(
-            id=db_object.id,
-            name=db_object.name,
-            content_type=db_object.content_type,
-            size=db_object.size,
-            created_at=str(db_object.created_at)
-        )
+        return obj
     except Exception as e:
+        db.rollback()
         logger.error(f"Failed to upload JSON object: {str(e)}")
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象批量上传接口
-@app.post("/upload/json/batch", response_model=List[ObjectMetadata])
+@api_router.post("/upload/json/batch", response_model=List[ObjectMetadata])
 async def upload_json_objects_batch(
     json_objects: List[JSONObjectModel], 
     db: Session = Depends(get_db)
@@ -309,7 +315,7 @@ async def upload_json_objects_batch(
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象更新接口
-@app.put("/update/json/{object_id}", response_model=ObjectMetadata)
+@api_router.put("/update/json/{object_id}", response_model=ObjectMetadata)
 async def update_json_object(
     object_id: str,
     json_data: JSONObjectModel, 
@@ -351,7 +357,7 @@ async def update_json_object(
         raise HTTPException(status_code=422, detail=str(e))
 
 # JSON对象查询接口
-@app.post("/query/json", response_model=List[JSONObjectResponse])
+@api_router.post("/query/json", response_model=List[JSONObjectResponse])
 async def query_json_objects(
     query: JSONQueryModel, 
     db: Session = Depends(get_db),
@@ -508,6 +514,9 @@ def _apply_filter(value, compare_value, operator):
             raise ValueError(f"不支持的运算符: {operator}")
     except TypeError:
         return False
+
+# 将路由添加到主应用
+app.include_router(api_router)
 
 # 启动服务器配置
 if __name__ == "__main__":
