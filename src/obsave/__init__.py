@@ -1,5 +1,5 @@
 """
-ObSave - High-Performance Object Storage Service
+ObSave - 高性能对象存储服务
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ObSave is a high-performance object storage service built on FastAPI.
@@ -21,6 +21,11 @@ __author__ = "ObSave Team"
 __license__ = "MIT"
 
 from obsave.core.storage import ObjectStorage
-from obsave.core.exceptions import ObjectStorageError
+from obsave.core.exceptions import StorageError, ObjectNotFoundError
 
-__all__ = ["ObjectStorage", "ObjectStorageError"]
+__all__ = [
+    'ObjectStorage',
+    'StorageError',
+    'ObjectNotFoundError',
+    '__version__'
+]

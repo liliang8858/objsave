@@ -8,7 +8,7 @@ import logging
 from threading import Lock
 import time
 from .exceptions import StorageError, ObjectNotFoundError
-from ..monitoring.metrics import metrics_collector
+from obsave.monitoring.metrics import metrics_collector
 
 logger = logging.getLogger(__name__)
 
