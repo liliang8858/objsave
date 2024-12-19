@@ -8,23 +8,127 @@ from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
 import json
 import time
+import msvcrt
+import win32file
+import win32event
+import pywintypes
+import win32con
 
 logger = logging.getLogger(__name__)
 
+class WindowsIOManager:
+    """Windows专用I/O管理器"""
+    
+    def __init__(self):
+        self.pending_ops = {}
+        self.callbacks = {}
+        self._running = False
+        
+    def start(self):
+        self._running = True
+        
+    def stop(self):
+        self._running = False
+        
+    async def write_file(self, file_path: str, data: bytes) -> bool:
+        try:
+            # 创建或打开文件
+            handle = win32file.CreateFile(
+                file_path,
+                win32file.GENERIC_WRITE,
+                0,  # 不共享
+                None,  # 默认安全属性
+                win32file.CREATE_ALWAYS,
+                win32file.FILE_FLAG_OVERLAPPED,  # 异步I/O
+                None
+            )
+            
+            try:
+                # 创建一个事件对象
+                event = win32event.CreateEvent(None, True, False, None)
+                overlapped = pywintypes.OVERLAPPED()
+                overlapped.hEvent = event
+                
+                # 写入数据
+                win32file.WriteFile(handle, data, overlapped)
+                
+                # 等待完成
+                rc = win32event.WaitForSingleObject(event, 5000)  # 5秒超时
+                if rc == win32event.WAIT_TIMEOUT:
+                    raise TimeoutError("Write operation timed out")
+                    
+                # 获取结果
+                bytes_written = win32file.GetOverlappedResult(handle, overlapped, True)
+                return bytes_written == len(data)
+                
+            finally:
+                handle.Close()
+                
+        except Exception as e:
+            logger.error(f"Windows write error: {str(e)}")
+            return False
+            
+class UnixIOManager:
+    """Unix系统I/O管理器"""
+    
+    def __init__(self):
+        self.selector = selectors.DefaultSelector()
+        self.write_buffers = {}
+        self.callbacks = {}
+        self._running = False
+        
+    def start(self):
+        self._running = True
+        
+    def stop(self):
+        self._running = False
+        self.selector.close()
+        
+    async def write_file(self, file_path: str, data: bytes) -> bool:
+        try:
+            # 以非阻塞模式打开文件
+            fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK)
+            try:
+                # 注册写事件
+                self.selector.register(fd, selectors.EVENT_WRITE)
+                
+                # 写入数据
+                total_written = 0
+                while total_written < len(data):
+                    events = self.selector.select(timeout=5.0)  # 5秒超时
+                    if not events:
+                        raise TimeoutError("Write operation timed out")
+                        
+                    for key, mask in events:
+                        if mask & selectors.EVENT_WRITE:
+                            remaining = data[total_written:]
+                            written = os.write(fd, remaining)
+                            total_written += written
+                            
+                return total_written == len(data)
+                
+            finally:
+                self.selector.unregister(fd)
+                os.close(fd)
+                
+        except Exception as e:
+            logger.error(f"Unix write error: {str(e)}")
+            return False
+            
 class AsyncIOManager:
     """跨平台异步I/O管理器"""
     
     def __init__(self, max_workers: Optional[int] = None):
-        self.selector = selectors.DefaultSelector()
-        self.loop = asyncio.get_event_loop()
-        self.write_queue = Queue()
         self.executor = ThreadPoolExecutor(
             max_workers=max_workers or min(32, (os.cpu_count() or 1) + 4)
         )
-        self.write_buffers: Dict[int, bytearray] = {}
-        self.callbacks: Dict[int, Callable] = {}
+        # 根据操作系统选择合适的I/O管理器
+        if os.name == 'nt':
+            self.io_manager = WindowsIOManager()
+        else:
+            self.io_manager = UnixIOManager()
+            
         self._running = False
-        self._worker_thread = None
         
     async def start(self):
         """启动I/O管理器"""
@@ -32,11 +136,7 @@ class AsyncIOManager:
             return
             
         self._running = True
-        self._worker_thread = threading.Thread(
-            target=self._io_worker,
-            daemon=True
-        )
-        self._worker_thread.start()
+        self.io_manager.start()
         logger.info("AsyncIO manager started")
         
     async def stop(self):
@@ -45,124 +145,24 @@ class AsyncIOManager:
             return
             
         self._running = False
-        if self._worker_thread:
-            self._worker_thread.join(timeout=5.0)
+        self.io_manager.stop()
         self.executor.shutdown(wait=False)
-        self.selector.close()
         logger.info("AsyncIO manager stopped")
         
-    def _io_worker(self):
-        """I/O工作线程"""
-        while self._running:
-            try:
-                events = self.selector.select(timeout=0.1)
-                for key, mask in events:
-                    fd = key.fd
-                    if mask & selectors.EVENT_WRITE:
-                        self._handle_write(fd)
-                    if mask & selectors.EVENT_READ:
-                        self._handle_read(fd)
-                        
-                # 处理写入队列
-                while not self.write_queue.empty() and self._running:
-                    fd, data, callback = self.write_queue.get_nowait()
-                    self._register_write(fd, data, callback)
-                    
-            except Exception as e:
-                logger.error(f"IO worker error: {str(e)}")
-                time.sleep(0.1)
-                
-    def _register_write(self, fd: int, data: bytes, callback: Optional[Callable] = None):
-        """注册写入操作"""
-        try:
-            self.write_buffers[fd] = bytearray(data)
-            self.callbacks[fd] = callback
-            self.selector.register(fd, selectors.EVENT_WRITE)
-        except Exception as e:
-            logger.error(f"Failed to register write for fd {fd}: {str(e)}")
-            if callback:
-                callback(False, str(e))
-                
-    def _handle_write(self, fd: int):
-        """处理写入事件"""
-        try:
-            if fd not in self.write_buffers:
-                return
-                
-            buffer = self.write_buffers[fd]
-            while buffer:
-                try:
-                    sent = os.write(fd, buffer)
-                    del buffer[:sent]
-                except BlockingIOError:
-                    break
-                except Exception as e:
-                    logger.error(f"Write error for fd {fd}: {str(e)}")
-                    self._cleanup_fd(fd, success=False, error=str(e))
-                    return
-                    
-            if not buffer:
-                self._cleanup_fd(fd, success=True)
-                
-        except Exception as e:
-            logger.error(f"Write handler error for fd {fd}: {str(e)}")
-            self._cleanup_fd(fd, success=False, error=str(e))
-            
-    def _cleanup_fd(self, fd: int, success: bool, error: str = None):
-        """清理文件描述符相关资源"""
-        try:
-            self.selector.unregister(fd)
-        except Exception:
-            pass
-            
-        callback = self.callbacks.pop(fd, None)
-        self.write_buffers.pop(fd, None)
-        
-        if callback:
-            try:
-                callback(success, error)
-            except Exception as e:
-                logger.error(f"Callback error for fd {fd}: {str(e)}")
-                
     async def write_file(self, file_path: str, data: bytes) -> bool:
         """异步写入文件"""
-        future = self.loop.create_future()
-        
-        def write_callback(success: bool, error: Optional[str] = None):
-            if success:
-                self.loop.call_soon_threadsafe(future.set_result, True)
-            else:
-                self.loop.call_soon_threadsafe(
-                    future.set_exception,
-                    Exception(error or "Write failed")
-                )
-                
+        if not self._running:
+            return False
+            
+        loop = asyncio.get_event_loop()
         try:
-            # 以非阻塞模式打开文件
-            flags = os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK
-            if os.name == 'nt':
-                flags |= os.O_BINARY
-                
-            fd = os.open(file_path, flags)
-            
-            # 将写入请求加入队列
-            self.write_queue.put((fd, data, write_callback))
-            
-            # 等待写入完成
-            try:
-                await future
-                return True
-            except Exception as e:
-                logger.error(f"Write failed for {file_path}: {str(e)}")
-                return False
-            finally:
-                try:
-                    os.close(fd)
-                except Exception:
-                    pass
-                    
+            # 在线程池中执行I/O操作
+            return await loop.run_in_executor(
+                self.executor,
+                lambda: self.io_manager.write_file(file_path, data)
+            )
         except Exception as e:
-            logger.error(f"Failed to open file {file_path}: {str(e)}")
+            logger.error(f"Write failed for {file_path}: {str(e)}")
             return False
             
     async def write_json(self, file_path: str, data: Dict[str, Any]) -> bool:
@@ -177,7 +177,6 @@ class AsyncIOManager:
     def get_stats(self) -> Dict[str, Any]:
         """获取I/O统计信息"""
         return {
-            "pending_writes": self.write_queue.qsize(),
-            "active_fds": len(self.write_buffers),
-            "thread_pool_size": self.executor._max_workers
+            "thread_pool_size": self.executor._max_workers,
+            "platform": "windows" if os.name == 'nt' else "unix"
         }

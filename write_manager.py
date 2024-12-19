@@ -182,116 +182,110 @@ class WriteManager:
         except Exception as e:
             logger.error(f"WAL recovery failed: {str(e)}")
             
-    async def _flush_loop(self):
-        """后台刷新循环"""
-        while self._running:
-            try:
-                # 等待刷新信号或超时
-                try:
-                    await asyncio.wait_for(
-                        self._flush_event.wait(),
-                        timeout=self.flush_interval
-                    )
-                except asyncio.TimeoutError:
-                    pass
-                    
-                self._flush_event.clear()
-                await self._flush_to_db()
-                
-            except Exception as e:
-                logger.error(f"Flush loop error: {str(e)}")
-                await asyncio.sleep(1)  # 错误后等待
-                
     async def _flush_to_db(self, force: bool = False):
-        """将数据刷新到数据库"""
-        if not self.write_queue and not force:
-            return
-            
+        """刷新数据到数据库"""
         async with self._queue_lock:
-            # 获取要写入的批次
-            batch_size = len(self.write_queue)
-            if batch_size == 0:
+            if not force and len(self.write_queue) < self.batch_size:
                 return
                 
-            if not force and batch_size < self.batch_size:
+            if not self.write_queue:
                 return
                 
-            # 准备批量写入的记录
+            # 获取待写入记录
             records = []
-            while self.write_queue and len(records) < self.batch_size:
-                records.append(self.write_queue.popleft())
-                
+            seen_ids = set()  # 用于去重
+            
+            while self.write_queue and (force or len(records) < self.batch_size):
+                record = self.write_queue.popleft()
+                # 检查ID是否重复
+                if record['id'] not in seen_ids:
+                    records.append(record)
+                    seen_ids.add(record['id'])
+                else:
+                    logger.warning(f"Duplicate record ID found: {record['id']}, skipping")
+                    
         if not records:
             return
             
-        # 批量写入数据库
         start_time = time.time()
+        db = SessionLocal()
         try:
-            session = SessionLocal()
-            try:
-                # 创建ORM对象
-                db_objects = []
-                for record in records:
-                    obj = ObjectStorage(
-                        id=record['id'],
-                        name=record['name'],
-                        content=record['content'],
-                        content_type=record['content_type'],
-                        type=record['type'],
-                        size=record['size'],
-                        created_at=datetime.fromisoformat(record['created_at']),
-                        owner=record.get('owner')
-                    )
-                    db_objects.append(obj)
-                    
-                # 批量插入
-                session.bulk_save_objects(db_objects)
-                session.commit()
+            # 首先检查数据库中已存在的ID
+            existing_ids = set(
+                row[0] for row in 
+                db.query(ObjectStorage.id).filter(
+                    ObjectStorage.id.in_([r['id'] for r in records])
+                ).all()
+            )
+            
+            # 过滤掉已存在的记录
+            new_records = [
+                record for record in records 
+                if record['id'] not in existing_ids
+            ]
+            
+            if not new_records:
+                logger.info("All records already exist in database")
+                return
                 
-                # 删除对应的WAL文件
-                for record in records:
-                    wal_pattern = f"{record['id']}_*.wal"
-                    for filename in os.listdir(self.wal_dir):
-                        if filename.startswith(record['id']):
-                            try:
-                                os.remove(os.path.join(self.wal_dir, filename))
-                            except Exception as e:
-                                logger.error(f"Failed to delete WAL {filename}: {str(e)}")
-                                
+            # 批量插入新记录
+            db_objects = [
+                ObjectStorage(
+                    id=record['id'],
+                    name=record['name'],
+                    content_type=record['content_type'],
+                    content=record['content'],
+                    type=record['type'],
+                    size=record['size'],
+                    created_at=record.get('created_at', datetime.now())
+                )
+                for record in new_records
+            ]
+            
+            try:
+                db.bulk_save_objects(db_objects)
+                db.commit()
+                
                 # 更新统计信息
                 write_time = time.time() - start_time
                 self.metrics.record_flush(
-                    size=len(records),
+                    size=len(new_records),
                     latency=write_time * 1000,  # 转换为毫秒
                     success=True
                 )
                 
-                logger.info(f"Successfully wrote {len(records)} records to database in {write_time:.2f}s")
+                logger.info(f"Successfully wrote {len(new_records)} records to database in {write_time:.2f}s")
                 
             except Exception as e:
+                db.rollback()
                 logger.error(f"Database write error: {str(e)}")
-                session.rollback()
                 
-                # 写入失败，放回队列
+                # 将失败的记录放回队列
                 async with self._queue_lock:
-                    for record in reversed(records):
-                        self.write_queue.appendleft(record)
-                        
+                    for record in reversed(new_records):
+                        if record['id'] not in existing_ids:  # 只放回不存在的记录
+                            self.write_queue.appendleft(record)
+                            
                 self.metrics.record_flush(
-                    size=len(records),
+                    size=len(new_records),
                     latency=(time.time() - start_time) * 1000,
                     success=False
                 )
                 raise
                 
-            finally:
-                session.close()
-                
-        except Exception as e:
-            logger.error(f"Flush error: {str(e)}")
-            # 触发重试
-            self._flush_event.set()
+        finally:
+            db.close()
             
+    async def _flush_loop(self):
+        """后台刷新循环"""
+        while self._running:
+            try:
+                await self._flush_to_db()
+                await asyncio.sleep(self.flush_interval)
+            except Exception as e:
+                logger.error(f"Flush loop error: {str(e)}")
+                await asyncio.sleep(1)  # 错误后短暂等待
+                
     def get_stats(self) -> Dict[str, Any]:
         """获取写入统计信息"""
         return {
