@@ -26,14 +26,19 @@ from config import settings
 from exceptions import ObjSaveException, ObjectNotFoundError, InvalidJSONPathError
 from monitoring import metrics, measure_time
 from backup import backup_manager
+from logging.handlers import RotatingFileHandler
 
 # 配置日志记录
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(name)s:%(pathname)s:%(lineno)d] - %(message)s',
+    level=logging.WARNING,  # 生产环境使用WARNING级别
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('objsave.log')
+        RotatingFileHandler(
+            'objsave.log',
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=5
+        )
     ]
 )
 logger = logging.getLogger(__name__)
@@ -148,15 +153,13 @@ request_semaphore = asyncio.Semaphore(settings.MAX_WORKERS)
 async def request_id_middleware(request: Request, call_next):
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
-    logger.info(f"[{request_id}] Request started: {request.method} {request.url.path}")
     
     try:
         async with request_semaphore:
             response = await call_next(request)
-            logger.info(f"[{request_id}] Request completed")
             return response
     except Exception as e:
-        logger.error(f"[{request_id}] Request failed: {str(e)}")
+        logger.error(f"Request {request_id} failed: {str(e)}")
         raise
 
 # 超时中间件
