@@ -2,6 +2,57 @@
 requires = ["setuptools>=45", "wheel", "setuptools_scm>=6.2"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "obsave"
+description = "A high-performance object storage service built with FastAPI"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {file = "LICENSE"}
+authors = [
+    {name = "ObSave Team", email = "team@obsave.org"},
+]
+keywords = ["object-storage", "fastapi", "async", "storage-service"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Filesystems",
+]
+dynamic = ["version"]
+dependencies = [
+    "fastapi>=0.68.0",
+    "uvicorn>=0.15.0",
+    "aiofiles>=0.8.0",
+    "python-multipart>=0.0.5",
+    "prometheus-client>=0.15.0",
+    "psutil>=5.9.0",
+    "jsonpath-ng>=1.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+    "pytest-asyncio>=0.18.0",
+    "black>=22.0.0",
+    "isort>=5.10.0",
+    "mypy>=0.950",
+    "flake8>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/obsave"
+Documentation = "https://obsave.readthedocs.io"
+Repository = "https://github.com/yourusername/obsave.git"
+"Bug Tracker" = "https://github.com/yourusername/obsave/issues"
+Changelog = "https://github.com/yourusername/obsave/blob/main/CHANGELOG.md"
+
 [tool.black]
 line-length = 88
 include = '\.pyi?$'
@@ -37,7 +88,22 @@ check_untyped_defs = true
 
 [tool.pytest.ini_options]
 minversion = "6.0"
-addopts = "-ra -q"
+addopts = "-ra -q --cov=src"
 testpaths = [
     "tests",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "examples/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "pass",
+    "raise ImportError",
 ]

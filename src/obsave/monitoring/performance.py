@@ -1,26 +1,38 @@
 import time
 import os
 import threading
-from typing import Dict, Any
+from typing import Dict, Any, List, Deque
 from datetime import datetime
 import logging
 from threading import Lock
+from collections import deque
+import psutil
+import weakref
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 class PerformanceMonitor:
     """性能监控类"""
-    def __init__(self):
+    def __init__(self, 
+                 max_response_times: int = 100,
+                 max_slow_requests: int = 10,
+                 slow_request_threshold: float = 1.0):
         self._lock = Lock()
+        self._max_response_times = max_response_times
+        self._max_slow_requests = max_slow_requests
+        self._slow_request_threshold = slow_request_threshold
+        
         self._metrics = {
             'requests_total': 0,
             'requests_error': 0,
             'requests_success': 0,
             'requests_active': 0,
-            'response_times': [],  # 最近100个请求的响应时间
-            'slow_requests': [],   # 最近10个慢请求
+            'response_times': deque(maxlen=max_response_times),
+            'slow_requests': deque(maxlen=max_slow_requests),
         }
         self._start_time = time.time()
+        self._process = psutil.Process()
         
     def request_start(self):
         """记录请求开始"""
@@ -35,19 +47,16 @@ class PerformanceMonitor:
             
             # 记录响应时间
             self._metrics['response_times'].append(duration)
-            if len(self._metrics['response_times']) > 100:
-                self._metrics['response_times'].pop(0)
-                
-            # 记录慢请求 (>1s)
-            if duration > 1.0:
+            
+            # 记录慢请求
+            if duration > self._slow_request_threshold:
                 self._metrics['slow_requests'].append({
                     'path': path,
                     'duration': duration,
-                    'time': datetime.now().isoformat()
+                    'time': datetime.now().isoformat(),
+                    'status_code': status_code
                 })
-                if len(self._metrics['slow_requests']) > 10:
-                    self._metrics['slow_requests'].pop(0)
-                    
+                
             # 记录成功/失败
             if 200 <= status_code < 400:
                 self._metrics['requests_success'] += 1
@@ -57,11 +66,18 @@ class PerformanceMonitor:
     def get_metrics(self) -> Dict[str, Any]:
         """获取性能指标"""
         with self._lock:
-            response_times = self._metrics['response_times']
+            uptime = time.time() - self._start_time
+            
+            # 计算响应时间统计
+            response_times = list(self._metrics['response_times'])
             avg_response_time = sum(response_times) / len(response_times) if response_times else 0
             
+            # 获取系统资源使用情况
+            memory_info = self._process.memory_info()
+            cpu_percent = self._process.cpu_percent()
+            
             return {
-                'uptime_seconds': int(time.time() - self._start_time),
+                'uptime': round(uptime, 2),
                 'requests': {
                     'total': self._metrics['requests_total'],
                     'success': self._metrics['requests_success'],
@@ -70,9 +86,15 @@ class PerformanceMonitor:
                 },
                 'response_time': {
                     'average': round(avg_response_time, 3),
-                    'p95': sorted(response_times)[int(len(response_times) * 0.95)] if len(response_times) > 20 else None,
+                    'samples': len(response_times),
                 },
-                'slow_requests': self._metrics['slow_requests']
+                'slow_requests': list(self._metrics['slow_requests']),
+                'system': {
+                    'memory_rss': memory_info.rss,
+                    'memory_vms': memory_info.vms,
+                    'cpu_percent': cpu_percent,
+                    'threads': len(self._process.threads()),
+                }
             }
             
 class ResourceManager:
@@ -82,14 +104,21 @@ class ResourceManager:
         self._max_workers = max_workers
         self._max_memory_mb = max_memory_mb
         self._active_workers = 0
+        self._process = psutil.Process()
+        self._worker_refs = weakref.WeakSet()
         
-    def acquire_worker(self) -> bool:
-        """获取工作线程"""
-        with self._lock:
-            if self._active_workers >= self._max_workers:
-                return False
-            self._active_workers += 1
-            return True
+    async def acquire_worker(self):
+        """获取工作线程，带资源检查"""
+        while True:
+            with self._lock:
+                if self._active_workers < self._max_workers:
+                    memory_usage = self._process.memory_info().rss / (1024 * 1024)
+                    if memory_usage < self._max_memory_mb:
+                        self._active_workers += 1
+                        worker_ref = weakref.ref(threading.current_thread())
+                        self._worker_refs.add(worker_ref)
+                        return True
+            await asyncio.sleep(0.1)
             
     def release_worker(self):
         """释放工作线程"""
@@ -100,12 +129,17 @@ class ResourceManager:
     def get_stats(self) -> Dict[str, Any]:
         """获取资源使用统计"""
         with self._lock:
+            memory_info = self._process.memory_info()
             return {
                 'workers': {
                     'active': self._active_workers,
                     'max': self._max_workers,
-                    'available': self._max_workers - self._active_workers
-                }
+                },
+                'memory': {
+                    'current_mb': memory_info.rss / (1024 * 1024),
+                    'max_mb': self._max_memory_mb,
+                },
+                'threads': len(self._process.threads()),
             }
             
 class AsyncLimiter:
@@ -114,9 +148,7 @@ class AsyncLimiter:
         self._sem = threading.Semaphore(max_concurrent)
         
     async def __aenter__(self):
-        acquired = self._sem.acquire(blocking=False)
-        if not acquired:
-            raise Exception("并发限制已达到最大值")
+        self._sem.acquire()
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
