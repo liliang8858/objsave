@@ -246,124 +246,358 @@ class JSONObjectResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+# JSON 查询模型
+class JSONQueryModel(BaseModel):
+    """JSON查询模型，用于定义JSON对象的查询条件"""
+    jsonpath: str
+    value: Optional[Any] = None
+    operator: Optional[str] = 'eq'
+    type: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+def validate_jsonpath(path: str) -> bool:
+    """验证 JSONPath 表达式的基本格式"""
+    if not path:
+        return False
+    if not path.startswith('$'):
+        return False
+    return True
+
 # 健康检查接口
-@router.get("/health")
+@router.get("/health",
+    summary="系统健康检查",
+    description="检查系统健康状态并返回所有性能指标",
+    response_description="返回系统状态和详细指标",
+    tags=["monitoring"])
 async def health_check():
-    """健康检查接口，返回系统状态和性能指标"""
+    """
+    系统健康检查接口，返回所有系统指标
+    
+    返回：
+    - 系统状态
+    - 所有性能指标
+    - 资源使用状况
+    - 存储系统状态
+    - 缓存状态
+    - 队列状态
+    - 工作流状态
+    - 告警信息
+    """
     try:
-        # 获取写入管理器状态
-        write_stats = write_manager.get_stats()
-        metrics = write_manager.metrics.get_metrics()
+        # 获取所有指标
+        all_metrics = metrics.get_metrics()
         
-        # 系统状态评估
-        status = "healthy"
-        alerts = []
+        # 提取系统指标
+        system = all_metrics['system']
         
-        # 检查写入延迟
-        current_latency = metrics['write_latency']['current']
-        avg_latency = metrics['write_latency']['avg']
-        if current_latency > avg_latency * 3:
-            alerts.append({
-                "level": "warning",
-                "message": f"High write latency: {current_latency:.2f}ms (avg: {avg_latency:.2f}ms)"
-            })
-            status = "degraded"
+        # 构建详细的健康状态响应
+        health_status = {
+            'status': 'initializing',  # 将在后面更新
+            'timestamp': datetime.utcnow().isoformat(),
+            'uptime_seconds': all_metrics.get('uptime_seconds', 0),
             
-        # 检查吞吐量
-        current_throughput = metrics['write_throughput']['current']
-        peak_throughput = metrics['write_throughput']['peak']
-        if current_throughput < peak_throughput * 0.5:
-            alerts.append({
-                "level": "warning",
-                "message": f"Low throughput: {current_throughput:.2f}B/s (peak: {peak_throughput:.2f}B/s)"
-            })
-            status = "degraded"
-            
-        # 检查CPU使用率
-        cpu_usage = metrics['cpu_usage']['current']
-        if cpu_usage > 80:
-            alerts.append({
-                "level": "warning",
-                "message": f"High CPU usage: {cpu_usage:.1f}%"
-            })
-            status = "degraded"
-            
-        # 检查队列积压
-        queue_size = metrics['queue_size']['current']
-        if queue_size > write_manager.max_queue_size * 0.8:
-            alerts.append({
-                "level": "warning",
-                "message": f"Queue near capacity: {queue_size}/{write_manager.max_queue_size}"
-            })
-            status = "degraded"
-            
-        # 检查错误率
-        error_rate = metrics['error_rate']['current']
-        if error_rate > 0.05:  # 5%错误率阈值
-            alerts.append({
-                "level": "critical",
-                "message": f"High error rate: {error_rate*100:.1f}%"
-            })
-            status = "unhealthy"
-            
-        # 构建健康检查响应
-        health_response = {
-            "status": status,
-            "timestamp": datetime.now().isoformat(),
-            "version": "1.0.0",  # 应用版本
-            
-            # 系统状态
-            "system": {
-                "cpu_usage": metrics['cpu_usage'],
-                "memory_mapped": {
-                    "current": metrics['memory_mapped']['current'] / (1024*1024),  # 转换为MB
-                    "avg": metrics['memory_mapped']['avg'] / (1024*1024)
+            # 详细的系统指标
+            'system': {
+                'cpu': {
+                    'usage_percent': system['cpu']['cpu_usage_percent'],
+                    'count_physical': system['cpu']['cpu_count_physical'],
+                    'count_logical': system['cpu']['cpu_count_logical'],
+                    'process_cpu_percent': system['cpu']['process_cpu_percent'],
+                    'process_cpu_times': system['cpu']['process_cpu_times'],
                 },
-                "io_wait": metrics['io_wait']
+                'memory': {
+                    'usage_percent': system['memory']['memory_usage_percent'],
+                    'available_gb': system['memory']['memory_available_gb'],
+                    'total_gb': system['memory']['memory_total_gb'],
+                    'process_rss_mb': system['memory']['process_memory_rss_mb'],
+                    'process_vms_mb': system['memory']['process_memory_vms_mb'],
+                },
+                'disk': {
+                    'usage_percent': system['disk']['disk_usage_percent'],
+                    'free_gb': system['disk']['disk_free_gb'],
+                    'total_gb': system['disk']['disk_total_gb'],
+                },
+                'process': {
+                    'threads_count': system['process']['process_threads_count'],
+                    'open_files': system['process']['process_open_files'],
+                    'connections': system['process']['process_connections'],
+                    'handles': system['process']['process_handles'],
+                    'children': system['process']['process_children'],
+                },
+                'io': {
+                    'read_mb': system['io']['process_io_read_mb'],
+                    'write_mb': system['io']['process_io_write_mb'],
+                    'read_count': system['io']['process_io_read_count'],
+                    'write_count': system['io']['process_io_write_count'],
+                },
+                'runtime': {
+                    'gc_counts': system['runtime']['python_gc_counts'],
+                    'threads_active': system['runtime']['python_threads_active'],
+                }
             },
             
-            # 写入性能
-            "write_performance": {
-                "latency_ms": metrics['write_latency'],
-                "throughput_bps": metrics['write_throughput'],
-                "queue_size": metrics['queue_size'],
-                "error_rate": metrics['error_rate']
-            },
+            # 存储系统详细指标
+            'storage': {},
             
-            # 累计统计
-            "statistics": {
-                "total_bytes_written": metrics['total_stats']['bytes_written'],
-                "total_operations": metrics['total_stats']['operations'],
-                "total_errors": metrics['error_rate']['total_errors']
-            },
+            # 队列详细指标
+            'queues': {},
+            
+            # 工作流详细指标
+            'workflows': {},
+            
+            # 线程池详细指标
+            'thread_pools': {},
+            
+            # 直方图统计
+            'histograms': all_metrics.get('histograms', {}),
+            
+            # 计数器指标
+            'counters': all_metrics.get('counter', {}),
+            
+            # 仪表盘指标
+            'gauges': all_metrics.get('gauge', {}),
             
             # 告警信息
-            "alerts": alerts,
+            'alerts': [],
             
-            # 缓存状态
-            "cache": {
-                "size": len(write_manager.cache),
-                "max_size": write_manager.max_queue_size
+            # 性能指标
+            'performance': {
+                'request_rates': {},
+                'error_rates': {},
+                'latencies': {},
             }
         }
         
-        # 设置响应状态码
-        status_code = 200 if status == "healthy" else 503 if status == "unhealthy" else 200
+        # 处理存储指标
+        storage_stats = all_metrics.get('storage', {})
+        for storage_type, stats in storage_stats.items():
+            storage_metrics = {
+                'operations': {},
+                'cache': {},
+                'flush': {}
+            }
+            
+            # 处理操作指标
+            for op_type, op_stats in stats.get('operations', {}).items():
+                storage_metrics['operations'][op_type] = {
+                    'count': op_stats['count'],
+                    'bytes': op_stats['bytes'],
+                    'error_count': op_stats['error_count'],
+                    'error_rate': (op_stats['error_count'] / op_stats['count'] * 100) if op_stats['count'] > 0 else 0,
+                    'latencies': op_stats['latencies'],
+                    'throughput_mbps': op_stats['bytes'] / (all_metrics.get('uptime_seconds', 1) * 1024 * 1024)
+                }
+            
+            # 处理缓存指标
+            cache_stats = stats.get('cache', {})
+            storage_metrics['cache'] = {
+                'hits': cache_stats.get('hits', 0),
+                'misses': cache_stats.get('misses', 0),
+                'hit_rate': cache_stats.get('hit_rate', 0),
+                'evictions': cache_stats.get('evictions', 0),
+                'eviction_rate': (cache_stats.get('evictions', 0) / 
+                    (cache_stats.get('hits', 0) + cache_stats.get('misses', 0)) * 100
+                    if (cache_stats.get('hits', 0) + cache_stats.get('misses', 0)) > 0 else 0)
+            }
+            
+            # 处理刷盘指标
+            flush_stats = stats.get('flush', {})
+            storage_metrics['flush'] = {
+                'count': flush_stats.get('count', 0),
+                'total_bytes': flush_stats.get('total_bytes', 0),
+                'avg_flush_size': (flush_stats.get('total_bytes', 0) / flush_stats.get('count', 1)
+                    if flush_stats.get('count', 0) > 0 else 0),
+                'durations': flush_stats.get('durations', {}),
+                'flush_rate': flush_stats.get('count', 0) / all_metrics.get('uptime_seconds', 1)
+            }
+            
+            health_status['storage'][storage_type] = storage_metrics
         
-        return JSONResponse(
-            content=health_response,
-            status_code=status_code
-        )
+        # 处理队列指标
+        queue_stats = all_metrics.get('queues', {})
+        for queue_name, stats in queue_stats.items():
+            health_status['queues'][queue_name] = {
+                'current_size': stats['qsize'],
+                'is_empty': stats['empty'],
+                'is_full': stats['full'],
+                'capacity': stats['maxsize'],
+                'utilization': (stats['qsize'] / stats['maxsize'] * 100) if stats['maxsize'] > 0 else 0
+            }
+        
+        # 处理工作流指标
+        workflow_stats = all_metrics.get('workflows', {})
+        for workflow_name, stats in workflow_stats.items():
+            health_status['workflows'][workflow_name] = {
+                'total_executions': stats['total'],
+                'successful': stats['success'],
+                'failed': stats['failed'],
+                'in_progress': stats['in_progress'],
+                'success_rate': stats['success_rate'],
+                'failure_rate': (stats['failed'] / stats['total'] * 100) if stats['total'] > 0 else 0,
+                'average_concurrency': stats['in_progress'] / all_metrics.get('uptime_seconds', 1),
+                'durations': stats.get('durations', {})
+            }
+        
+        # 处理线程池指标
+        thread_pool_stats = all_metrics.get('thread_pools', {})
+        for pool_name, stats in thread_pool_stats.items():
+            health_status['thread_pools'][pool_name] = {
+                'workers': stats['workers'],
+                'tasks_total': stats['tasks_total'],
+                'threads_alive': stats['threads_alive'],
+                'utilization': (stats['threads_alive'] / stats['workers'] * 100) if stats['workers'] > 0 else 0,
+                'task_per_worker': stats['tasks_total'] / stats['workers'] if stats['workers'] > 0 else 0
+            }
+        
+        # 计算性能指标
+        for op_type in ['read', 'write', 'delete']:
+            total_ops = sum(
+                stats['operations'].get(op_type, {}).get('count', 0)
+                for stats in storage_stats.values()
+            )
+            total_errors = sum(
+                stats['operations'].get(op_type, {}).get('error_count', 0)
+                for stats in storage_stats.values()
+            )
+            uptime = all_metrics.get('uptime_seconds', 1)
+            
+            health_status['performance']['request_rates'][op_type] = total_ops / uptime
+            health_status['performance']['error_rates'][op_type] = (
+                total_errors / total_ops * 100 if total_ops > 0 else 0
+            )
+        
+        # 评估系统整体健康状态
+        status_checks = {
+            'cpu_healthy': system['cpu']['cpu_usage_percent'] < 90,
+            'memory_healthy': system['memory']['memory_usage_percent'] < 90,
+            'disk_healthy': system['disk']['disk_usage_percent'] < 90,
+            'storage_healthy': all(
+                all(op['error_rate'] < 5 for op in stats['operations'].values())
+                for stats in health_status['storage'].values()
+            ),
+            'cache_healthy': all(
+                stats['cache']['hit_rate'] > 60
+                for stats in health_status['storage'].values()
+            ),
+            'queues_healthy': all(
+                not stats['is_full']
+                for stats in health_status['queues'].values()
+            ),
+            'workflows_healthy': all(
+                stats['success_rate'] > 95
+                for stats in health_status['workflows'].values()
+            )
+        }
+        
+        # 更新系统状态
+        if all(status_checks.values()):
+            health_status['status'] = 'healthy'
+        elif any(not check for check in [
+            status_checks['cpu_healthy'],
+            status_checks['memory_healthy'],
+            status_checks['disk_healthy']
+        ]):
+            health_status['status'] = 'critical'
+        else:
+            health_status['status'] = 'degraded'
+        
+        # 添加告警信息
+        if not status_checks['cpu_healthy']:
+            health_status['alerts'].append({
+                'level': 'critical',
+                'message': f'Critical CPU usage: {system["cpu"]["cpu_usage_percent"]}%'
+            })
+        elif system['cpu']['cpu_usage_percent'] > 80:
+            health_status['alerts'].append({
+                'level': 'warning',
+                'message': f'High CPU usage: {system["cpu"]["cpu_usage_percent"]}%'
+            })
+        
+        if not status_checks['memory_healthy']:
+            health_status['alerts'].append({
+                'level': 'critical',
+                'message': f'Critical memory usage: {system["memory"]["memory_usage_percent"]}%'
+            })
+        elif system['memory']['memory_usage_percent'] > 80:
+            health_status['alerts'].append({
+                'level': 'warning',
+                'message': f'High memory usage: {system["memory"]["memory_usage_percent"]}%'
+            })
+        
+        if not status_checks['disk_healthy']:
+            health_status['alerts'].append({
+                'level': 'critical',
+                'message': f'Critical disk usage: {system["disk"]["disk_usage_percent"]}%'
+            })
+        elif system['disk']['disk_usage_percent'] > 80:
+            health_status['alerts'].append({
+                'level': 'warning',
+                'message': f'High disk usage: {system["disk"]["disk_usage_percent"]}%'
+            })
+        
+        # 存储系统告警
+        for storage_type, stats in health_status['storage'].items():
+            for op_type, op_stats in stats['operations'].items():
+                if op_stats['error_rate'] > 5:
+                    health_status['alerts'].append({
+                        'level': 'critical',
+                        'message': f'High error rate in {storage_type} {op_type}: {op_stats["error_rate"]}%'
+                    })
+                elif op_stats['error_rate'] > 1:
+                    health_status['alerts'].append({
+                        'level': 'warning',
+                        'message': f'Elevated error rate in {storage_type} {op_type}: {op_stats["error_rate"]}%'
+                    })
+            
+            if stats['cache']['hit_rate'] < 50:
+                health_status['alerts'].append({
+                    'level': 'warning',
+                    'message': f'Low cache hit rate in {storage_type}: {stats["cache"]["hit_rate"]}%'
+                })
+        
+        # 队列告警
+        for queue_name, stats in health_status['queues'].items():
+            if stats['is_full']:
+                health_status['alerts'].append({
+                    'level': 'critical',
+                    'message': f'Queue {queue_name} is full'
+                })
+            elif stats['utilization'] > 80:
+                health_status['alerts'].append({
+                    'level': 'warning',
+                    'message': f'High queue utilization in {queue_name}: {stats["utilization"]}%'
+                })
+        
+        # 工作流告警
+        for workflow_name, stats in health_status['workflows'].items():
+            if stats['failure_rate'] > 5:
+                health_status['alerts'].append({
+                    'level': 'critical',
+                    'message': f'High failure rate in workflow {workflow_name}: {stats["failure_rate"]}%'
+                })
+            elif stats['failure_rate'] > 1:
+                health_status['alerts'].append({
+                    'level': 'warning',
+                    'message': f'Elevated failure rate in workflow {workflow_name}: {stats["failure_rate"]}%'
+                })
+        
+        # 线程池告警
+        for pool_name, stats in health_status['thread_pools'].items():
+            if stats['utilization'] > 90:
+                health_status['alerts'].append({
+                    'level': 'warning',
+                    'message': f'High thread pool utilization in {pool_name}: {stats["utilization"]}%'
+                })
+        
+        return health_status
         
     except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return JSONResponse(
-            content={
-                "status": "error",
-                "timestamp": datetime.now().isoformat(),
-                "error": str(e)
-            },
-            status_code=500
+        logger.exception("Health check failed")
+        raise ObjSaveException(
+            status_code=500,
+            detail="Health check failed",
+            error_code="HEALTH_CHECK_FAILED"
         )
 
 # 上传对象接口
@@ -717,21 +951,6 @@ async def update_json_object(
     except Exception as e:
         logger.error(f"[{request_id}] Update failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# JSON 查询模型
-class JSONQueryModel(BaseModel):
-    jsonpath: str
-    value: Optional[Any] = None
-    operator: Optional[str] = 'eq'
-    type: Optional[str] = None
-
-def validate_jsonpath(path: str) -> bool:
-    """验证 JSONPath 表达式的基本格式"""
-    if not path:
-        return False
-    if not path.startswith('$'):
-        return False
-    return True
 
 # JSON对象查询接口
 @router.post("/query/json", response_model=List[JSONObjectResponse])
