@@ -1,141 +1,108 @@
-# ObjSave - High-Performance Object Storage Service
+# ObSave
 
-ObjSave is a high-performance object storage service built on FastAPI, providing robust capabilities for object storage, retrieval, updates, and querying. It is designed for high performance, reliability, and ease of use.
+[![Build Status](https://github.com/yourusername/obsave/workflows/CI/badge.svg)](https://github.com/yourusername/obsave/actions)
+[![Coverage Status](https://coveralls.io/repos/github/yourusername/obsave/badge.svg?branch=main)](https://coveralls.io/github/yourusername/obsave?branch=main)
+[![PyPI version](https://badge.fury.io/py/obsave.svg)](https://badge.fury.io/py/obsave)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python Version](https://img.shields.io/pypi/pyversions/obsave.svg)](https://pypi.org/project/obsave/)
 
 English | [简体中文](README_zh.md)
 
+A high-performance object storage service built with FastAPI, designed for reliability, scalability, and ease of use.
+
 ## Features
 
-- **High Performance** - Asynchronous processing, memory caching, support for massive concurrency
+- **High Performance** - Asynchronous processing with memory caching
 - **Object Storage** - Store and retrieve objects of any type
-- **Smart Querying** - Complex queries supported via JSONPath
-- **Monitoring** - Comprehensive system monitoring and performance metrics
-- **Security** - Access control and data encryption
-- **Real-time Monitoring** - Real-time system status monitoring and alerts
+- **Smart Querying** - Complex queries via JSONPath
+- **Monitoring** - Comprehensive system monitoring and metrics
+- **Security** - Built-in access control and encryption
+- **Real-time Monitoring** - System status monitoring and alerts
 
-## Version Information
+## Installation
 
-- Version: 1.0.0
-- Release Date: 2024-12-19
-- Python Version Required: >=3.8
+```bash
+pip install obsave
+```
+
+For development installation:
+
+```bash
+git clone https://github.com/yourusername/obsave.git
+cd obsave
+pip install -e ".[dev]"
+```
 
 ## Quick Start
 
-### Environment Setup
+```python
+from obsave import ObjectStorage
 
-```bash
-# Create virtual environment
-python -m venv objectstorage_env
+# Initialize storage
+storage = ObjectStorage()
 
-# Activate virtual environment
-# Windows
-objectstorage_env\Scripts\activate
-# Linux/Mac
-source objectstorage_env/bin/activate
+# Store an object
+storage.store("my_key", {"data": "value"})
 
-# Install dependencies
-pip install -r requirements.txt
+# Retrieve an object
+obj = storage.get("my_key")
+print(obj)  # {"data": "value"}
 ```
 
-### Start Service
+For more examples, see the [examples](examples/) directory.
+
+## Documentation
+
+Full documentation is available at [https://obsave.readthedocs.io/](https://obsave.readthedocs.io/).
+
+## Development
+
+We use a number of tools to ensure code quality:
 
 ```bash
-python app.py
+# Install development dependencies
+make install
+
+# Run tests
+make test
+
+# Format code
+make format
+
+# Run linters
+make lint
+
+# Build documentation
+make docs
 ```
 
-### Access Service
+## Project Structure
 
-- API Documentation: http://localhost:8000/docs
-- Health Check: http://localhost:8000/objsave/health
-- Metrics: http://localhost:8000/objsave/metrics
-
-## API Endpoints
-
-### Object Operations
-- `POST /objsave/objects` - Store object
-- `GET /objsave/objects/{id}` - Retrieve object
-- `PUT /objsave/objects/{id}` - Update object
-- `DELETE /objsave/objects/{id}` - Delete object
-
-### Query Interfaces
-- `POST /objsave/query/json` - JSON object query
-- `GET /objsave/query/metadata` - Metadata query
-
-### Monitoring Interfaces
-- `GET /objsave/health` - System health status
-- `GET /objsave/metrics` - Performance metrics
-
-## Monitoring Metrics
-
-### System Metrics
-- CPU Usage
-- Memory Usage
-- Disk Usage
-- Process Status
-
-### Storage Metrics
-- Operation Count and Latency
-- Cache Hit Rate
-- Error Rate Statistics
-- Data Size Statistics
-
-### HTTP Metrics
-- Request Rate and Error Rate
-- Latency Distribution
-- Status Code Statistics
-- Response Size Statistics
-
-## Configuration
-
-Key Configuration Items:
-- `PORT`: Service port (default: 8000)
-- `HOST`: Service address (default: 0.0.0.0)
-- `STORAGE_PATH`: Storage path
-- `MAX_OBJECT_SIZE`: Maximum object size
-- `CACHE_SIZE`: Cache size
-
-## Performance Optimization
-
-1. Asynchronous Processing:
-   - Async IO
-   - Background Task Processing
-   - Batch Operation Optimization
-
-2. Caching Strategy:
-   - Memory Cache
-   - Hot Data Optimization
-   - Cache Preheating
-
-3. Storage Optimization:
-   - Data Compression
-   - Batch Writing
-   - Delayed Writing
-
-## Monitoring Alerts
-
-Supports multi-level alerts:
-- Critical: Severe issues requiring immediate attention
-- Warning: Potential issues requiring attention
-- Info: Informational notifications
-
-## Development Roadmap
-
-1. Short-term Plans:
-   - Distributed Storage Support
-   - Data Compression Optimization
-   - Additional Query Features
-
-2. Long-term Plans:
-   - Cluster Support
-   - Data Backup and Recovery
-   - More Storage Backends
+```
+obsave/
+├── src/
+│   └── obsave/
+│       ├── api/        # FastAPI routes and endpoints
+│       ├── core/       # Core functionality
+│       ├── storage/    # Storage backends
+│       ├── monitoring/ # Monitoring and metrics
+│       └── utils/      # Utility functions
+├── tests/             # Test suite
+├── docs/              # Documentation
+├── examples/          # Example code
+└── scripts/           # Utility scripts
+```
 
 ## Contributing
 
-We welcome all forms of contributions, whether it's new features, documentation improvements, or bug reports!
+We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
 ## License
 
-This project is licensed under the MIT License. For commercial use, please contact: sblig3@gmail.com
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-See the [LICENSE](LICENSE) file for details.
+For commercial use, please contact: sblig3@gmail.com
+
+## Acknowledgments
+
+Special thanks to all our [contributors](https://github.com/yourusername/obsave/graphs/contributors) who have helped make ObSave better.
