@@ -1,5 +1,5 @@
 {
-  "timestamp": "2024-12-19T13:31:49.747560",
+  "timestamp": "2024-12-19T13:42:19.793797",
   "io_wait": {
     "current": 0,
     "avg": 0.0
@@ -9,8 +9,8 @@
     "avg": 0.0
   },
   "memory_mapped": {
-    "current": 58974208,
-    "avg": 59031552.0
+    "current": 60268544,
+    "avg": 60136448.0
   },
   "write_throughput": {
     "current": 0,

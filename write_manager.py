@@ -229,19 +229,25 @@ class WriteManager:
                 return
                 
             # 批量插入新记录
-            db_objects = [
-                ObjectStorage(
+            db_objects = []
+            for record in new_records:
+                # 确保created_at是datetime对象
+                if isinstance(record.get('created_at'), str):
+                    created_at = datetime.fromisoformat(record['created_at'])
+                else:
+                    created_at = record.get('created_at') or datetime.now()
+                    
+                obj = ObjectStorage(
                     id=record['id'],
                     name=record['name'],
                     content_type=record['content_type'],
                     content=record['content'],
                     type=record['type'],
                     size=record['size'],
-                    created_at=record.get('created_at', datetime.now())
+                    created_at=created_at
                 )
-                for record in new_records
-            ]
-            
+                db_objects.append(obj)
+                
             try:
                 db.bulk_save_objects(db_objects)
                 db.commit()

@@ -73,6 +73,25 @@ class MetricsCollector:
             # 记录延迟
             self.metrics['write_latency'].append(latency)
             
+    def record_flush(self, size: int, latency: float, success: bool = True):
+        """记录刷新操作"""
+        with self._lock:
+            if success:
+                # 更新写入统计
+                self.write_stats['total_bytes'] += size
+                self.write_stats['total_ops'] += size
+                
+                # 记录延迟和吞吐量
+                self.metrics['write_latency'].append(latency)
+                self.metrics['write_throughput'].append(size / (latency / 1000.0))  # bytes/second
+            else:
+                self.write_stats['error_count'] += size
+                
+            # 更新错误率
+            if self.write_stats['total_ops'] > 0:
+                error_rate = self.write_stats['error_count'] / self.write_stats['total_ops']
+                self.metrics['error_rate'].append(error_rate)
+
     def record_queue_size(self, size: int):
         """记录队列大小"""
         with self._lock:
