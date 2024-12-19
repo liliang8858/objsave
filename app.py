@@ -32,35 +32,59 @@ logger = logging.getLogger(__name__)
 
 # 系统配置
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
-MAX_WORKERS = min(32, multiprocessing.cpu_count() * 2)  # 工作线程数
-CHUNK_SIZE = 8192  # 8KB
+MAX_WORKERS = min(32, multiprocessing.cpu_count() * 4)  # 增加工作线程数
+CHUNK_SIZE = 64 * 1024  # 增加到64KB以提高传输效率
+CACHE_MAX_ITEMS = 20000  # 增加缓存容量
+CACHE_SHARDS = 32  # 增加分片数减少锁竞争
+CACHE_TTL = 3600  # 缓存过期时间（秒）
 
 # 创建线程池
 thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # 创建存储管理器实例
-storage = StorageManager()
+storage = StorageManager(
+    base_path="storage",  # 存储目录
+    chunk_size=CHUNK_SIZE,
+    max_concurrent_ops=MAX_WORKERS
+)
 
 # 创建缓存管理器实例
 cache = CacheManager(
-    max_items=10000,  # 最大缓存项数
-    shards=16  # 增加分片数以减少锁竞争
+    max_items=CACHE_MAX_ITEMS,
+    shards=CACHE_SHARDS,
+    ttl=CACHE_TTL
 )
 
-# 认证方案
-# security_bearer = HTTPBearer()
+# 创建请求队列实例
+request_queue = RequestQueue(
+    max_workers=MAX_WORKERS
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up server...")
     logger.info(f"Available workers: {MAX_WORKERS}")
+    logger.info(f"Cache config: max_items={CACHE_MAX_ITEMS}, shards={CACHE_SHARDS}, ttl={CACHE_TTL}s")
     
     # 初始化数据库
     init_db()
     
     # 启动请求队列处理器
-    await RequestQueue(max_workers=MAX_WORKERS).start()
+    await request_queue.start()
+    
+    # 定期清理过期缓存
+    async def cache_cleanup():
+        while True:
+            try:
+                cache.cleanup_expired()
+                await asyncio.sleep(300)  # 每5分钟清理一次
+            except Exception as e:
+                logger.error(f"Cache cleanup error: {str(e)}")
+                await asyncio.sleep(60)  # 出错后等待1分钟再试
+                
+    # 启动缓存清理任务
+    asyncio.create_task(cache_cleanup())
     
     try:
         yield
@@ -196,7 +220,7 @@ async def health_check():
     try:
         cache_stats = cache.get_stats()
         storage_stats = storage.get_stats()
-        queue_stats = RequestQueue(max_workers=MAX_WORKERS).get_stats()
+        queue_stats = request_queue.get_stats()
         
         return {
             "status": "healthy",
@@ -263,7 +287,7 @@ async def upload_object(
             
         # 将任务加入队列，优先处理小文件
         priority = 0 if len(content) < 1024 * 1024 else 1  # 1MB以下的文件优先处理
-        task_id = await RequestQueue(max_workers=MAX_WORKERS).enqueue(
+        task_id = await request_queue.enqueue(
             upload_task,
             priority=priority,
             is_cpu_bound=len(content) > 5 * 1024 * 1024  # 5MB以上的文件使用线程池处理
@@ -271,7 +295,7 @@ async def upload_object(
         
         # 等待结果
         while True:
-            result = RequestQueue(max_workers=MAX_WORKERS).get_result(task_id)
+            result = request_queue.get_result(task_id)
             if result:
                 if result["status"] == "completed":
                     return result["result"]
@@ -312,7 +336,7 @@ async def download_object(
             }
             
         # 将下载任务加入队列
-        task_id = await RequestQueue(max_workers=MAX_WORKERS).enqueue(
+        task_id = await request_queue.enqueue(
             download_task,
             priority=0,  # 下载请求优先处理
             is_cpu_bound=False
@@ -320,7 +344,7 @@ async def download_object(
         
         # 等待结果
         while True:
-            result = RequestQueue(max_workers=MAX_WORKERS).get_result(task_id)
+            result = request_queue.get_result(task_id)
             if result:
                 if result["status"] == "completed":
                     data = result["result"]
