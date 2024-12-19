@@ -1,24 +1,32 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Float, Text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Float, Text, JSON
 from sqlalchemy.orm import relationship
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional, Dict, Any
+import uuid
+from sqlalchemy.sql import func
+from sqlalchemy.ext.declarative import declarative_base
 
-from database import Base
+from obsave.core.database import Base
 
 class ObjectStorage(Base):
-    """数据库存储对象模型"""
-    __tablename__ = "objects"
-    
-    id = Column(String, primary_key=True)
-    name = Column(String)
-    content_type = Column(String)
-    content = Column(Text)  # 使用Text类型存储JSON内容
-    type = Column(String)   # 添加type字段
-    size = Column(Integer)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    owner = Column(String, nullable=True)
-    
+    """对象存储数据模型"""
+    __tablename__ = 'object_storage'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String(255), nullable=False)
+    content_type = Column(String(100), nullable=False)
+    type = Column(String(50), nullable=True)
+    size = Column(Integer, nullable=False)
+    content = Column(Text, nullable=True)
+    obj_metadata = Column(JSON, nullable=True)
+    owner = Column(String(100), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<ObjectStorage(id={self.id}, name={self.name}, type={self.type})>"
+
 class ObjectMetadata(BaseModel):
     """对象元数据模型"""
     id: str

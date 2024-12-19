@@ -9,6 +9,7 @@ from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, APIRouter
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import desc, asc
 from pydantic import BaseModel, ConfigDict
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,9 +22,10 @@ import threading
 import mmap
 import weakref
 
-from obsave.core.storage import ObjectStorage
+from obsave.core.storage import ObjectStorage as StorageManager
 from obsave.core.exceptions import StorageError, ObjectNotFoundError
-from obsave.core.database import get_db, init_db
+from obsave.core.database import get_db, init_db, Base
+from obsave.core.models import ObjectStorage
 from obsave.monitoring.metrics import metrics_collector
 from obsave.monitoring.middleware import PrometheusMiddleware
 
@@ -265,7 +267,7 @@ upload_thread_pool = ThreadPoolExecutor(
 )
 
 # 创建存储管理器实例
-storage = ObjectStorage(
+storage = StorageManager(
     base_path="storage",
     chunk_size=CHUNK_SIZE,
     max_concurrent_ops=MAX_WORKERS
@@ -446,45 +448,89 @@ async def download_object(
 # 列出所有对象接口
 @router.get("/list", response_model=List[ObjectMetadata])
 async def list_objects(
+    db: Session = Depends(get_db),
     limit: Optional[int] = 100,
     offset: Optional[int] = 0,
-    last_id: Optional[str] = None  # 游标分页
+    last_id: Optional[str] = None,  # 游标分页
+    type: Optional[str] = None,     # 按类型过滤
+    sort: Optional[str] = "desc"    # 排序方向
 ):
-    """列出存储的对象"""
+    """列出存储的对象，支持分页、过滤和排序"""
     try:
-        # 验证参数
-        if limit < 0 or offset < 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Limit and offset must be non-negative"
-            )
+        # 1. 参数验证和规范化
+        limit = min(max(1, limit), 1000)  # 限制范围 1-1000
+        offset = max(0, offset)
+        sort = sort.lower() if sort else "desc"
         
-        if limit > 1000:
-            raise HTTPException(
-                status_code=400,
-                detail="Maximum limit is 1000"
-            )
+        # 2. 构建缓存键
+        cache_key = f"list:{last_id}:{limit}:{offset}:{type}:{sort}"
+        cached_data = cache.get(cache_key)
+        if cached_data:
+            return cached_data
             
-        # 使用游标分页
-        if last_id:
-            objects = await storage.list_files_after(last_id, limit)
-        else:
-            objects = await storage.list_files(limit=limit, offset=offset)
+        # 3. 构建高性能查询
+        def db_operation():
+            try:
+                query = db.query(ObjectStorage)
+                
+                # 添加过滤条件
+                if last_id:
+                    query = query.filter(
+                        ObjectStorage.id > last_id if sort == "asc" 
+                        else ObjectStorage.id < last_id
+                    )
+                if type:
+                    query = query.filter(ObjectStorage.type == type)
+                    
+                # 优化排序
+                query = query.order_by(
+                    asc(ObjectStorage.id) if sort == "asc"
+                    else desc(ObjectStorage.id)
+                )
+                
+                # 使用 LIMIT/OFFSET 优化
+                if not last_id:
+                    query = query.offset(offset)
+                query = query.limit(limit)
+                
+                # 执行查询并获取结果
+                return query.all()
+            except Exception as e:
+                logger.error(f"Database query error: {str(e)}")
+                raise
             
-        return objects
+        # 4. 异步执行查询
+        objects = await asyncio.get_event_loop().run_in_executor(
+            thread_pool,
+            db_operation
+        )
         
-    except StorageError as e:
-        logger.error(f"Storage error while listing objects: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to list objects"
-        ) from e
+        # 5. 高效转换结果
+        result = [
+            ObjectMetadata(
+                id=obj.id,
+                name=obj.name,
+                content_type=obj.content_type,
+                size=obj.size,
+                created_at=str(obj.created_at)
+            )
+            for obj in objects
+        ]
+        
+        # 6. 智能缓存
+        if len(result) > 0:
+            # 只缓存有数据的结果
+            ttl = 60 if len(result) < 100 else 30  # 根据结果大小调整缓存时间
+            cache.set(cache_key, result, ttl=ttl)
+        
+        return result
+        
     except Exception as e:
         logger.error(f"Error listing objects: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail="Internal server error"
-        ) from e
+            detail={"message": "获取列表失败", "error": str(e)}
+        )
 
 # 创建FastAPI应用
 app = FastAPI(
