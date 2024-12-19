@@ -39,4 +39,6 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+objsave.log*
+write_metrics.json
 
