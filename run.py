@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 import asyncio
 import shutil
+from fastapi import Path, Body, Query
 
 # 配置日志
 logging.basicConfig(
@@ -29,14 +30,26 @@ logger = logging.getLogger(__name__)
 # 创建应用实例
 app = FastAPI(
     title="ObSave API",
-    description="High-performance object storage service",
-    version="1.0.0"
+    description="""ObSave 是一个高性能对象存储服务。
+    
+    ## 功能特点
+    * 对象存储：支持存储、获取、删除对象
+    * JSON 存储：支持 JSON 对象的存储和查询
+    * 文件上传：支持文件上传和管理
+    * 备份管理：支持创建和恢复备份
+    * 监控指标：集成 Prometheus 监控
+    """,
+    version="1.0.0",
+    docs_url="/objsave/docs",
+    redoc_url="/objsave/redoc",
+    openapi_url="/objsave/openapi.json"
 )
 
 # 创建路由器
 router = APIRouter(
     prefix="/objsave",
-    tags=["object-storage"]
+    tags=["object-storage"],
+    responses={404: {"description": "Not found"}},
 )
 
 # 添加中间件
@@ -71,8 +84,17 @@ class BackupInfo(BaseModel):
     status: str
 
 # 健康检查端点
-@router.get("/health")
+@router.get("/health", 
+    summary="健康检查",
+    description="检查服务是否正常运行",
+    response_description="返回服务状态信息")
 async def health_check():
+    """
+    健康检查端点，用于监控服务状态
+    
+    Returns:
+        dict: 包含服务状态、时间戳和版本信息
+    """
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -80,27 +102,92 @@ async def health_check():
     }
 
 # 对象存储端点
-@router.post("/objects/{key}")
-async def store_object(key: str, data: bytes):
+@router.post("/objects/{key}",
+    summary="存储对象",
+    description="将数据存储到指定的键下",
+    response_description="返回存储操作的结果")
+async def store_object(
+    key: str = Path(..., description="对象的唯一标识符"),
+    data: bytes = Body(..., description="要存储的数据")
+):
+    """
+    存储对象数据
+    
+    Args:
+        key: 对象的唯一标识符
+        data: 要存储的二进制数据
+        
+    Returns:
+        dict: 包含操作是否成功的信息
+    """
     success = await storage.store(key, data)
     return {"success": success}
 
-@router.get("/objects/{key}")
-async def get_object(key: str):
+@router.get("/objects/{key}",
+    summary="获取对象",
+    description="获取指定键的对象数据",
+    response_description="返回对象数据或错误信息",
+    responses={
+        404: {"description": "对象未找到"},
+        200: {"description": "成功返回对象数据"}
+    })
+async def get_object(
+    key: str = Path(..., description="要获取的对象的唯一标识符")
+):
+    """
+    获取对象数据
+    
+    Args:
+        key: 对象的唯一标识符
+        
+    Returns:
+        dict: 包含对象数据或错误信息
+        
+    Raises:
+        ObjectNotFoundError: 如果对象不存在
+    """
     try:
         data = await storage.get(key)
         return {"data": data}
     except ObjectNotFoundError:
         return {"error": "Object not found"}
 
-@router.delete("/objects/{key}")
-async def delete_object(key: str):
+@router.delete("/objects/{key}",
+    summary="删除对象",
+    description="删除指定键的对象",
+    response_description="返回删除操作的结果")
+async def delete_object(
+    key: str = Path(..., description="要删除的对象的唯一标识符")
+):
+    """
+    删除对象
+    
+    Args:
+        key: 对象的唯一标识符
+        
+    Returns:
+        dict: 包含操作是否成功的信息
+    """
     success = await storage.delete(key)
     return {"success": success}
 
 # 文件上传端点
-@router.post("/upload/file")
-async def upload_file(file: UploadFile = File(...)):
+@router.post("/upload/file",
+    summary="上传文件",
+    description="上传文件并存储",
+    response_description="返回上传结果，包含文件ID和元数据")
+async def upload_file(
+    file: UploadFile = File(..., description="要上传的文件")
+):
+    """
+    上传文件接口
+    
+    Args:
+        file: 要上传的文件对象
+        
+    Returns:
+        dict: 包含文件ID、文件名、内容类型、大小等信息
+    """
     try:
         # 生成唯一文件名
         file_id = str(uuid.uuid4())
@@ -124,8 +211,22 @@ async def upload_file(file: UploadFile = File(...)):
         return {"success": False, "error": str(e)}
 
 # JSON 对象端点
-@router.post("/upload/json")
-async def upload_json(json_obj: JSONObject):
+@router.post("/upload/json",
+    summary="上传 JSON 对象",
+    description="上传并存储 JSON 对象",
+    response_description="返回上传结果，包含对象ID和元数据")
+async def upload_json(
+    json_obj: JSONObject = Body(..., description="要上传的 JSON 对象")
+):
+    """
+    上传 JSON 对象
+    
+    Args:
+        json_obj: JSON 对象数据
+        
+    Returns:
+        dict: 包含对象ID、类型、名称、大小等信息
+    """
     try:
         # 生成唯一ID
         obj_id = str(uuid.uuid4())
@@ -146,8 +247,22 @@ async def upload_json(json_obj: JSONObject):
         logger.error(f"Error uploading JSON: {str(e)}")
         return {"success": False, "error": str(e)}
 
-@router.post("/upload/json/batch")
-async def upload_json_batch(objects: List[JSONObject]):
+@router.post("/upload/json/batch",
+    summary="批量上传 JSON 对象",
+    description="批量上传并存储多个 JSON 对象",
+    response_description="返回每个对象的上传结果")
+async def upload_json_batch(
+    objects: List[JSONObject] = Body(..., description="要上传的 JSON 对象列表")
+):
+    """
+    批量上传 JSON 对象
+    
+    Args:
+        objects: JSON 对象列表
+        
+    Returns:
+        dict: 包含每个对象的上传结果
+    """
     results = []
     for obj in objects:
         try:
@@ -169,8 +284,24 @@ async def upload_json_batch(objects: List[JSONObject]):
     return {"results": results}
 
 # 列出对象
-@router.get("/list")
-async def list_objects(limit: int = 10, offset: int = 0):
+@router.get("/list",
+    summary="列出对象",
+    description="列出存储的所有对象，支持分页",
+    response_description="返回对象列表和分页信息")
+async def list_objects(
+    limit: int = Query(10, description="每页数量", ge=1, le=100),
+    offset: int = Query(0, description="起始位置", ge=0)
+):
+    """
+    列出存储的对象
+    
+    Args:
+        limit: 每页返回的对象数量，默认10，最大100
+        offset: 分页偏移量，默认0
+        
+    Returns:
+        dict: 包含对象列表和分页信息
+    """
     try:
         # 获取存储目录
         storage_path = storage.base_path
@@ -212,18 +343,52 @@ async def list_objects(limit: int = 10, offset: int = 0):
         return {"error": "Failed to list objects"}
 
 # 统计信息
-@router.get("/stats")
+@router.get("/stats",
+    summary="获取统计信息",
+    description="获取存储系统的统计信息",
+    response_description="返回存储统计数据")
 async def get_stats():
+    """
+    获取存储统计信息
+    
+    Returns:
+        dict: 包含存储使用情况的统计信息
+    """
     return storage.get_stats()
 
 # 监控指标端点
-@router.get("/metrics")
+@router.get("/metrics",
+    summary="获取监控指标",
+    description="获取 Prometheus 格式的监控指标",
+    response_description="返回 Prometheus 格式的指标数据")
 async def metrics():
+    """
+    获取 Prometheus 监控指标
+    
+    Returns:
+        Response: Prometheus 格式的指标数据
+    """
     return await metrics_endpoint()
 
 # 备份相关端点
-@router.post("/backup/create")
-async def create_backup(background_tasks: BackgroundTasks, name: Optional[str] = None):
+@router.post("/backup/create",
+    summary="创建备份",
+    description="创建系统数据的备份",
+    response_description="返回备份创建的结果")
+async def create_backup(
+    background_tasks: BackgroundTasks,
+    name: Optional[str] = Query(None, description="备份名称，如果不指定将自动生成")
+):
+    """
+    创建系统备份
+    
+    Args:
+        background_tasks: 后台任务对象
+        name: 可选的备份名称
+        
+    Returns:
+        dict: 包含备份创建的状态信息
+    """
     try:
         # 生成备份名称
         backup_name = name or f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -251,8 +416,17 @@ async def create_backup(background_tasks: BackgroundTasks, name: Optional[str] =
         logger.error(f"Error creating backup: {str(e)}")
         return {"success": False, "error": str(e)}
 
-@router.get("/backup/list")
+@router.get("/backup/list",
+    summary="列出备份",
+    description="列出所有可用的备份",
+    response_description="返回备份列表")
 async def list_backups():
+    """
+    列出所有备份
+    
+    Returns:
+        dict: 包含备份列表，每个备份包含名称、大小、创建时间等信息
+    """
     try:
         backup_dir = os.path.join(os.path.dirname(__file__), "data", "backups")
         if not os.path.exists(backup_dir):
@@ -283,8 +457,22 @@ async def list_backups():
         logger.error(f"Error listing backups: {str(e)}")
         return {"error": "Failed to list backups"}
 
-@router.post("/backup/restore/{backup_name}")
-async def restore_backup(backup_name: str):
+@router.post("/backup/restore/{backup_name}",
+    summary="恢复备份",
+    description="从指定的备份恢复系统数据",
+    response_description="返回恢复操作的结果")
+async def restore_backup(
+    backup_name: str = Path(..., description="要恢复的备份名称")
+):
+    """
+    恢复系统备份
+    
+    Args:
+        backup_name: 要恢复的备份名称
+        
+    Returns:
+        dict: 包含恢复操作的结果
+    """
     try:
         backup_path = os.path.join(os.path.dirname(__file__), "data", "backups", backup_name, "storage")
         if not os.path.exists(backup_path):
