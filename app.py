@@ -174,6 +174,30 @@ async def timeout_middleware(request: Request, call_next):
             content={"detail": "Request timeout"}
         )
 
+# HTTP指标中间件
+@app.middleware("http")
+async def http_metrics_middleware(request: Request, call_next):
+    """HTTP请求指标收集中间件"""
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    
+    # 获取响应大小
+    size = 0
+    if hasattr(response, 'body'):
+        size = len(response.body)
+    
+    # 记录请求指标
+    metrics.http.record_request(
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration=duration * 1000,  # 转换为毫秒
+        size=size
+    )
+    
+    return response
+
 # CORS中间件
 app.add_middleware(
     CORSMiddleware,
@@ -271,19 +295,6 @@ def validate_jsonpath(path: str) -> bool:
     response_description="返回系统状态和详细指标",
     tags=["monitoring"])
 async def health_check():
-    """
-    系统健康检查接口，返回所有系统指标
-    
-    返回：
-    - 系统状态
-    - 所有性能指标
-    - 资源使用状况
-    - 存储系统状态
-    - 缓存状态
-    - 队列状态
-    - 工作流状态
-    - 告警信息
-    """
     try:
         # 获取所有指标
         all_metrics = metrics.get_metrics()
@@ -293,7 +304,7 @@ async def health_check():
         
         # 构建详细的健康状态响应
         health_status = {
-            'status': 'initializing',  # 将在后面更新
+            'status': 'initializing',
             'timestamp': datetime.utcnow().isoformat(),
             'uptime_seconds': all_metrics.get('uptime_seconds', 0),
             
@@ -366,7 +377,31 @@ async def health_check():
                 'request_rates': {},
                 'error_rates': {},
                 'latencies': {},
-            }
+            },
+            
+            # HTTP指标
+            'http': {
+                'summary': {
+                    'total_endpoints': len(all_metrics.get('http', {})),
+                    'total_requests': sum(
+                        endpoint['total_requests']
+                        for endpoint in all_metrics.get('http', {}).values()
+                    ),
+                    'total_errors': sum(
+                        endpoint['error_count']
+                        for endpoint in all_metrics.get('http', {}).values()
+                    ),
+                    'requests_per_minute': sum(
+                        endpoint['requests_per_minute']
+                        for endpoint in all_metrics.get('http', {}).values()
+                    ),
+                    'errors_per_minute': sum(
+                        endpoint['errors_per_minute']
+                        for endpoint in all_metrics.get('http', {}).values()
+                    ),
+                },
+                'endpoints': all_metrics.get('http', {})
+            },
         }
         
         # 处理存储指标
@@ -487,7 +522,12 @@ async def health_check():
             'workflows_healthy': all(
                 stats['success_rate'] > 95
                 for stats in health_status['workflows'].values()
-            )
+            ),
+            'http_healthy': all(
+                endpoint['error_rate_per_minute'] < 5  # 每分钟错误率小于5%
+                for endpoint in all_metrics.get('http', {}).values()
+                if endpoint['requests_per_minute'] > 0  # 只检查有流量的端点
+            ),
         }
         
         # 更新系统状态
@@ -589,6 +629,29 @@ async def health_check():
                     'level': 'warning',
                     'message': f'High thread pool utilization in {pool_name}: {stats["utilization"]}%'
                 })
+        
+        # HTTP相关告警
+        for endpoint, stats in all_metrics.get('http', {}).items():
+            # 高错误率告警
+            if stats['requests_per_minute'] > 0:  # 只检查有流量的端点
+                if stats['error_rate_per_minute'] > 10:
+                    health_status['alerts'].append({
+                        'level': 'critical',
+                        'message': f'High error rate on {endpoint}: {stats["error_rate_per_minute"]:.1f}% errors/min'
+                    })
+                elif stats['error_rate_per_minute'] > 5:
+                    health_status['alerts'].append({
+                        'level': 'warning',
+                        'message': f'Elevated error rate on {endpoint}: {stats["error_rate_per_minute"]:.1f}% errors/min'
+                    })
+            
+            # 高延迟告警
+            if 'latencies' in stats and 'p99' in stats['latencies']:
+                if stats['latencies']['p99'] > 1000:  # p99延迟超过1秒
+                    health_status['alerts'].append({
+                        'level': 'warning',
+                        'message': f'High latency on {endpoint}: p99={stats["latencies"]["p99"]:.0f}ms'
+                    })
         
         return health_status
         

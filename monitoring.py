@@ -10,6 +10,7 @@ from datetime import datetime
 import os
 from queue import Queue
 import gc
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -314,77 +315,133 @@ class StorageMetrics:
                 result[storage_type] = storage_metrics
             return result
 
+class HTTPMetrics:
+    """HTTP 请求指标收集"""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._requests = defaultdict(lambda: {
+            'total': 0,
+            'success': 0,
+            'failed': 0,
+            'latencies': [],
+            'status_codes': defaultdict(int),
+            'sizes': [],
+            'last_minute_requests': deque(maxlen=60),  # 保存最近1分钟的请求时间戳
+            'last_minute_errors': deque(maxlen=60),    # 保存最近1分钟的错误时间戳
+        })
+    
+    def record_request(self, method: str, path: str, status_code: int, 
+                      duration: float, size: int = 0):
+        """记录HTTP请求"""
+        now = time.time()
+        with self._lock:
+            metrics = self._requests[f"{method} {path}"]
+            metrics['total'] += 1
+            metrics['status_codes'][status_code] += 1
+            metrics['latencies'].append(duration)
+            if size > 0:
+                metrics['sizes'].append(size)
+            
+            # 更新成功/失败计数
+            if 200 <= status_code < 400:
+                metrics['success'] += 1
+                metrics['last_minute_requests'].append(now)
+            else:
+                metrics['failed'] += 1
+                metrics['last_minute_errors'].append(now)
+            
+            # 只保留最近1000个样本
+            if len(metrics['latencies']) > 1000:
+                metrics['latencies'] = metrics['latencies'][-1000:]
+            if len(metrics['sizes']) > 1000:
+                metrics['sizes'] = metrics['sizes'][-1000:]
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """获取HTTP指标"""
+        now = time.time()
+        with self._lock:
+            http_metrics = {}
+            for endpoint, metrics in self._requests.items():
+                # 计算最近1分钟的请求率和错误率
+                recent_requests = sum(1 for t in metrics['last_minute_requests'] 
+                                   if now - t <= 60)
+                recent_errors = sum(1 for t in metrics['last_minute_errors'] 
+                                  if now - t <= 60)
+                
+                # 计算延迟分位数
+                latencies = metrics['latencies']
+                latency_percentiles = {}
+                if latencies:
+                    latencies.sort()
+                    latency_percentiles = {
+                        'min': latencies[0],
+                        'max': latencies[-1],
+                        'avg': sum(latencies) / len(latencies),
+                        'p50': latencies[int(len(latencies) * 0.5)],
+                        'p90': latencies[int(len(latencies) * 0.9)],
+                        'p95': latencies[int(len(latencies) * 0.95)],
+                        'p99': latencies[int(len(latencies) * 0.99)]
+                    }
+                
+                # 计算响应大小统计
+                sizes = metrics['sizes']
+                size_stats = {}
+                if sizes:
+                    sizes.sort()
+                    size_stats = {
+                        'min': sizes[0],
+                        'max': sizes[-1],
+                        'avg': sum(sizes) / len(sizes)
+                    }
+                
+                http_metrics[endpoint] = {
+                    'total_requests': metrics['total'],
+                    'success_count': metrics['success'],
+                    'error_count': metrics['failed'],
+                    'success_rate': (metrics['success'] / metrics['total'] * 100 
+                                   if metrics['total'] > 0 else 0),
+                    'requests_per_minute': recent_requests,
+                    'errors_per_minute': recent_errors,
+                    'error_rate_per_minute': (recent_errors / recent_requests * 100 
+                                            if recent_requests > 0 else 0),
+                    'status_codes': dict(metrics['status_codes']),
+                    'latencies': latency_percentiles,
+                    'response_sizes': size_stats
+                }
+            
+            return http_metrics
+
+class Metrics:
+    """系统指标收集"""
+    
+    def __init__(self):
+        self.start_time = time.time()
+        self.system = SystemMetrics()
+        self.storage = StorageMetrics()
+        self.queues = QueueMetrics()
+        self.workflows = WorkflowMetrics()
+        self.thread_pools = ThreadPoolMetrics()
+        self.http = HTTPMetrics()  # 添加HTTP指标收集器
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """获取所有指标"""
+        return {
+            'uptime_seconds': int(time.time() - self.start_time),
+            'system': self.system.get_system_metrics(),
+            'storage': self.storage.get_metrics(),
+            'queues': self.queues.get_metrics(),
+            'workflows': self.workflows.get_metrics(),
+            'thread_pools': self.thread_pools.get_metrics(),
+            'http': self.http.get_metrics()  # 添加HTTP指标
+        }
+
 # 创建指标收集器实例
 queue_metrics = QueueMetrics()
 workflow_metrics = WorkflowMetrics()
 thread_pool_metrics = ThreadPoolMetrics()
 storage_metrics = StorageMetrics()
-
-class Metrics:
-    def __init__(self):
-        self._metrics = defaultdict(lambda: defaultdict(float))
-        self._histograms = defaultdict(list)
-        self._lock = threading.Lock()
-        self.start_time = time.time()
-    
-    def record(self, metric_name: str, value: float, metric_type: str = "counter"):
-        with self._lock:
-            if metric_type == "counter":
-                self._metrics[metric_type][metric_name] += value
-            elif metric_type == "gauge":
-                self._metrics[metric_type][metric_name] = value
-            elif metric_type == "histogram":
-                self._histograms[metric_name].append(value)
-                if len(self._histograms[metric_name]) > 1000:
-                    self._histograms[metric_name] = self._histograms[metric_name][-1000:]
-    
-    def get_histogram_stats(self, metric_name: str) -> Dict[str, float]:
-        with self._lock:
-            if not self._histograms[metric_name]:
-                return {}
-            values = sorted(self._histograms[metric_name])
-            return {
-                'min': values[0],
-                'max': values[-1],
-                'avg': sum(values) / len(values),
-                'p50': values[len(values) // 2],
-                'p95': values[int(len(values) * 0.95)],
-                'p99': values[int(len(values) * 0.99)]
-            }
-    
-    def get_metrics(self) -> Dict[str, Any]:
-        with self._lock:
-            metrics_data = {
-                metric_type: dict(metrics)
-                for metric_type, metrics in self._metrics.items()
-            }
-            
-            # 添加直方图统计
-            metrics_data['histograms'] = {
-                name: self.get_histogram_stats(name)
-                for name in self._histograms.keys()
-            }
-            
-            # 添加系统指标
-            metrics_data['system'] = SystemMetrics.get_system_metrics()
-            
-            # 添加队列指标
-            metrics_data['queues'] = queue_metrics.get_metrics()
-            
-            # 添加工作流指标
-            metrics_data['workflows'] = workflow_metrics.get_metrics()
-            
-            # 添加线程池指标
-            metrics_data['thread_pools'] = thread_pool_metrics.get_metrics()
-            
-            # 添加存储指标
-            metrics_data['storage'] = storage_metrics.get_metrics()
-            
-            # 添加运行时间
-            uptime = time.time() - self.start_time
-            metrics_data['uptime_seconds'] = uptime
-            
-            return metrics_data
+http_metrics = HTTPMetrics()
 
 metrics = Metrics()
 
