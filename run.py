@@ -28,6 +28,7 @@ from obsave.core.database import get_db, init_db, Base
 from obsave.core.models import ObjectStorage
 from obsave.monitoring.metrics import metrics_collector
 from obsave.monitoring.middleware import PrometheusMiddleware
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, REGISTRY
 
 # 配置日志记录
 logging.basicConfig(
@@ -275,7 +276,8 @@ storage = StorageManager(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    """应用生命周期管理"""
+    # 启动
     logger.info("Starting up server...")
     logger.info(f"Available workers: {MAX_WORKERS}")
     logger.info(f"Cache config: max_items={CACHE_MAX_ITEMS}, shards={CACHE_SHARDS}, ttl={CACHE_TTL}s")
@@ -291,12 +293,87 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown
-    logger.info("Shutting down...")
+    # 关闭
+    logger.info("Shutting down server...")
+    
+    # 停止请求队列处理器
     await request_queue.stop()
+    
+    # 停止写入管理器
     await write_manager.stop()
-    thread_pool.shutdown(wait=False)
-    upload_thread_pool.shutdown(wait=False)
+    
+    # 关闭数据库连接
+    # TODO: 实现数据库连接关闭逻辑
+
+# 创建 FastAPI 应用
+app = FastAPI(
+    title="ObjSave API",
+    description="""
+    ObjSave 是一个高性能的对象存储服务。
+    
+    ## 功能特点
+    
+    * 支持文件对象和 JSON 对象的存储
+    * 提供高性能的查询和检索功能
+    * 内置缓存和批处理机制
+    * 支持系统备份和恢复
+    * 提供完整的监控指标
+    
+    ## API 文档
+    
+    * `/objsave/docs` - Swagger UI 文档（当前页面）
+    * `/objsave/redoc` - ReDoc 文档（更适合阅读）
+    * `/objsave/openapi.json` - OpenAPI 规范
+    
+    ## 认证
+    
+    目前支持以下认证方式：
+    * API Key（请在请求头中添加 `X-API-Key`）
+    
+    ## 错误处理
+    
+    所有错误响应都遵循统一的格式：
+    ```json
+    {
+        "detail": "错误信息"
+    }
+    ```
+    
+    ## 性能监控
+    
+    可以通过 `/objsave/metrics` 端点获取系统性能指标。
+    """,
+    version="1.0.0",
+    docs_url="/objsave/docs",
+    redoc_url="/objsave/redoc",
+    openapi_url="/objsave/openapi.json",
+    openapi_tags=[
+        {
+            "name": "object-storage",
+            "description": "对象存储相关操作，包括上传、下载和查询",
+        },
+        {
+            "name": "monitoring",
+            "description": "系统监控相关接口，包括性能指标和统计信息",
+        },
+        {
+            "name": "backup",
+            "description": "系统备份和恢复相关操作",
+        }
+    ],
+    contact={
+        "name": "ObjSave Team",
+        "url": "https://github.com/yourusername/objsave",
+        "email": "support@objsave.com",
+    },
+    license_info={
+        "name": "MIT",
+        "url": "https://opensource.org/licenses/MIT",
+    }
+)
+
+# 更新应用配置，使用新的 lifespan
+app.router.lifespan_context = lifespan
 
 # 对象元数据模型
 class ObjectMetadata(BaseModel):
@@ -532,20 +609,29 @@ async def list_objects(
             detail={"message": "获取列表失败", "error": str(e)}
         )
 
-# 创建FastAPI应用
-app = FastAPI(
-    title="ObjSave API",
-    description="""
-    对象存储API服务
+# 监控相关API
+@router.get("/metrics", tags=["monitoring"])
+async def get_metrics():
+    """
+    获取系统性能指标
     
-    提供以下功能:
-    - 文件上传和下载
-    - 对象元数据管理
-    - 存储统计信息
-    """,
-    version="1.0.0",
-    lifespan=lifespan
-)
+    返回以下指标：
+    * CPU使用率
+    * 内存使用情况
+    * 磁盘使用状态
+    * 请求处理统计
+    * 操作耗时统计
+    """
+    try:
+        # 收集系统指标
+        metrics_collector.collect_system_metrics()
+        return Response(
+            content=generate_latest(REGISTRY),
+            media_type=CONTENT_TYPE_LATEST
+        )
+    except Exception as e:
+        logger.error(f"Error collecting metrics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # 创建请求信号量，限制并发请求数
 request_semaphore = asyncio.Semaphore(MAX_WORKERS)
@@ -611,11 +697,6 @@ app.add_middleware(
 
 # 注册路由
 app.include_router(router)
-
-# 在应用启动时开始收集指标
-@app.on_event("startup")
-async def start_metrics_collector():
-    metrics_collector.start()
 
 if __name__ == "__main__":
     import uvicorn
