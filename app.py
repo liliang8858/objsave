@@ -21,6 +21,7 @@ from cache_manager import CacheManager
 from fastapi.middleware.gzip import GZipMiddleware
 from models import ObjectStorage, ObjectMetadata
 from database import get_db, init_db
+from write_manager import WriteManager
 
 # 配置日志记录
 logging.basicConfig(
@@ -68,6 +69,13 @@ request_queue = RequestQueue(
     max_workers=MAX_WORKERS
 )
 
+# 全局写入管理器
+write_manager = WriteManager(
+    batch_size=100,      # 每批次100条记录
+    flush_interval=1.0,  # 每秒刷新一次
+    max_queue_size=10000 # 最大队列大小
+)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -80,12 +88,19 @@ async def lifespan(app: FastAPI):
     
     # 启动请求队列处理器
     await request_queue.start()
+    
+    # 启动写入管理器
+    await write_manager.start()
+    
     yield
     
     # Shutdown
     logger.info("Shutting down...")
     thread_pool.shutdown(wait=False)
     upload_thread_pool.shutdown(wait=False)
+    
+    # 关闭写入管理器
+    await write_manager.stop()
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -404,56 +419,40 @@ async def upload_json_object(
         object_id = str(uuid.uuid4())
         current_time = datetime.now()
         
-        # 使用超时保护的数据库操作
+        # 创建记录
+        record = {
+            'id': object_id,
+            'name': json_data.name or object_id,
+            'content': content_str,
+            'content_type': 'application/json',
+            'type': json_data.type,
+            'size': content_size,
+            'created_at': current_time.isoformat(),
+            'owner': None
+        }
+        
+        # 添加到写入队列
         try:
-            async with asyncio.timeout(5):  # 5秒超时
-                obj = ObjectStorage(
-                    id=object_id,
-                    name=json_data.name or object_id,
-                    content=content_str,
-                    content_type='application/json',
-                    type=json_data.type,
-                    size=content_size,
-                    created_at=current_time,
-                    owner=None
-                )
-                db.add(obj)
-                await asyncio.to_thread(db.commit)
-                db.refresh(obj)
-                logger.debug(f"[{request_id}] Database operation completed")
+            await write_manager.add_record(record)
+            logger.debug(f"[{request_id}] Record added to write queue")
+            
+            # 等待写入确认
+            if not await write_manager.wait_for_confirm(object_id, timeout=5.0):
+                logger.warning(f"[{request_id}] Write confirmation timeout")
                 
-        except asyncio.TimeoutError:
-            logger.error(f"[{request_id}] Database operation timed out")
-            db.rollback()
-            raise HTTPException(status_code=408, detail="Database timeout")
         except Exception as e:
-            logger.error(f"[{request_id}] Database error: {str(e)}")
-            db.rollback()
-            raise HTTPException(status_code=500, detail="Database error")
+            logger.error(f"[{request_id}] Write queue error: {str(e)}")
+            raise HTTPException(status_code=500, detail="Write queue error")
             
         # 准备响应
         metadata = ObjectMetadata(
-            id=obj.id,
-            name=obj.name,
-            content_type=obj.content_type,
-            size=obj.size,
-            created_at=obj.created_at.isoformat(),
-            type=obj.type
+            id=object_id,
+            name=record['name'],
+            content_type=record['content_type'],
+            size=record['size'],
+            created_at=record['created_at'],
+            type=record['type']
         )
-        
-        # 异步缓存操作
-        try:
-            logger.debug(f"[{request_id}] Starting cache operation")
-            async with asyncio.timeout(2):  # 2秒缓存超时
-                await asyncio.gather(
-                    asyncio.to_thread(lambda: cache.set(f"metadata:{object_id}", metadata.dict())),
-                    asyncio.to_thread(lambda: cache.set(f"content:{object_id}", json_data.content))
-                )
-            logger.debug(f"[{request_id}] Cache operation completed")
-        except asyncio.TimeoutError:
-            logger.warning(f"[{request_id}] Cache operation timed out")
-        except Exception as e:
-            logger.error(f"[{request_id}] Cache error: {str(e)}")
         
         logger.info(f"[{request_id}] Upload completed successfully")
         return metadata
@@ -681,6 +680,12 @@ async def query_json_objects(
     except Exception as e:
         logger.error(f"[{request_id}] Query failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# 添加监控端点
+@router.get("/stats")
+async def get_write_stats():
+    """获取写入统计信息"""
+    return write_manager.get_stats()
 
 # 注册路由
 app.include_router(router)
