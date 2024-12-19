@@ -16,10 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 from contextlib import asynccontextmanager
 from request_queue import RequestQueue
-from security_manager import SecurityManager
 from storage_manager import StorageManager
 from cache_manager import CacheManager
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.gzip import GZipMiddleware
 from models import ObjectStorage, ObjectMetadata
 from database import get_db, init_db
@@ -49,12 +47,8 @@ cache = CacheManager(
     shards=16  # 增加分片数以减少锁竞争
 )
 
-# 创建管理器实例
-security = SecurityManager()
-request_queue = RequestQueue(max_workers=MAX_WORKERS)
-
 # 认证方案
-security_bearer = HTTPBearer()
+# security_bearer = HTTPBearer()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -66,7 +60,7 @@ async def lifespan(app: FastAPI):
     init_db()
     
     # 启动请求队列处理器
-    await request_queue.start()
+    await RequestQueue(max_workers=MAX_WORKERS).start()
     
     try:
         yield
@@ -113,7 +107,6 @@ class ObjectMetadata(BaseModel):
     content_type: str
     size: int
     created_at: str
-    owner: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -127,10 +120,10 @@ class JSONObjectModel(BaseModel):
 
 # JSON 查询模型
 class JSONQueryModel(BaseModel):
-    jsonpath: str  # JSONPath查询表达式
-    value: Optional[Any] = None  # 可选的精确匹配值
-    operator: Optional[str] = 'eq'  # 比较运算符：eq, gt, lt, ge, le, contains
-    type: Optional[str] = None  # JSON对象类型
+    jsonpath: str
+    value: Optional[Any] = None
+    operator: Optional[str] = 'eq'
+    type: Optional[str] = None
 
 # JSON对象响应模型
 class JSONObjectResponse(BaseModel):
@@ -144,22 +137,14 @@ class JSONObjectResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-# 安全中间件
+# 安全中间件 - 简化版
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     try:
-        # 获取客户端IP
-        client_ip = request.client.host
-        
-        # 验证请求数据
+        # 基本请求验证
         if request.method in ["POST", "PUT"]:
             try:
                 body = await request.json()
-                if not security.validate_request_data(body):
-                    return JSONResponse(
-                        status_code=400,
-                        content={"detail": "Invalid request data"}
-                    )
             except:
                 pass  # 非JSON请求体，跳过验证
                 
@@ -204,33 +189,6 @@ async def performance_middleware(request: Request, call_next):
             content={"detail": "Internal server error"}
         )
 
-# 认证依赖
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security_bearer)
-) -> Dict:
-    token = credentials.credentials
-    payload = security.verify_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return payload
-
-# 权限检查装饰器
-def require_permission(permission: str):
-    def decorator(func):
-        async def wrapper(*args, user: Dict = Depends(get_current_user), **kwargs):
-            if not security.has_permission(user.get("role", ""), permission):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Not enough permissions"
-                )
-            return await func(*args, user=user, **kwargs)
-        return wrapper
-    return decorator
-
 # 健康检查接口
 @router.get("/health")
 async def health_check():
@@ -238,15 +196,13 @@ async def health_check():
     try:
         cache_stats = cache.get_stats()
         storage_stats = storage.get_stats()
-        queue_stats = request_queue.get_stats()
-        security_stats = security.get_stats()
+        queue_stats = RequestQueue(max_workers=MAX_WORKERS).get_stats()
         
         return {
             "status": "healthy",
             "cache": cache_stats,
             "storage": storage_stats,
             "queue": queue_stats,
-            "security": security_stats,
             "system": {
                 "workers": MAX_WORKERS
             }
@@ -257,11 +213,9 @@ async def health_check():
 
 # 上传对象接口
 @router.post("/upload")
-@require_permission("write")
 async def upload_object(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    user: Dict = Depends(get_current_user)
+    db: Session = Depends(get_db)
 ):
     """上传对象到存储服务"""
     try:
@@ -289,8 +243,7 @@ async def upload_object(
                 name=file.filename,
                 content_type=file.content_type,
                 size=len(content),
-                created_at=datetime.now().isoformat(),
-                owner=user["user_id"]
+                created_at=datetime.now().isoformat()
             )
             
             # 存储元数据到数据库
@@ -299,19 +252,18 @@ async def upload_object(
                 name=metadata.name,
                 content_type=metadata.content_type,
                 size=metadata.size,
-                created_at=metadata.created_at,
-                owner=metadata.owner
+                created_at=metadata.created_at
             )
             
             db.add(db_obj)
             db.commit()
             
-            logger.info(f"Object {object_id} uploaded by {user['user_id']} using {storage_type}")
+            logger.info(f"Object {object_id} uploaded using {storage_type}")
             return metadata
             
         # 将任务加入队列，优先处理小文件
         priority = 0 if len(content) < 1024 * 1024 else 1  # 1MB以下的文件优先处理
-        task_id = await request_queue.enqueue(
+        task_id = await RequestQueue(max_workers=MAX_WORKERS).enqueue(
             upload_task,
             priority=priority,
             is_cpu_bound=len(content) > 5 * 1024 * 1024  # 5MB以上的文件使用线程池处理
@@ -319,7 +271,7 @@ async def upload_object(
         
         # 等待结果
         while True:
-            result = request_queue.get_result(task_id)
+            result = RequestQueue(max_workers=MAX_WORKERS).get_result(task_id)
             if result:
                 if result["status"] == "completed":
                     return result["result"]
@@ -335,11 +287,9 @@ async def upload_object(
 
 # 下载对象接口
 @router.get("/download/{object_id}")
-@require_permission("read")
 async def download_object(
     object_id: str,
-    db: Session = Depends(get_db),
-    user: Dict = Depends(get_current_user)
+    db: Session = Depends(get_db)
 ):
     """下载指定对象"""
     try:
@@ -347,10 +297,6 @@ async def download_object(
             db_obj = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
             if not db_obj:
                 raise HTTPException(status_code=404, detail="Object not found")
-                
-            # 检查权限
-            if db_obj.owner != user["user_id"] and user["role"] != "admin":
-                raise HTTPException(status_code=403, detail="Not authorized to access this object")
                 
             # 尝试从缓存获取
             content = cache.get(object_id)
@@ -366,7 +312,7 @@ async def download_object(
             }
             
         # 将下载任务加入队列
-        task_id = await request_queue.enqueue(
+        task_id = await RequestQueue(max_workers=MAX_WORKERS).enqueue(
             download_task,
             priority=0,  # 下载请求优先处理
             is_cpu_bound=False
@@ -374,7 +320,7 @@ async def download_object(
         
         # 等待结果
         while True:
-            result = request_queue.get_result(task_id)
+            result = RequestQueue(max_workers=MAX_WORKERS).get_result(task_id)
             if result:
                 if result["status"] == "completed":
                     data = result["result"]
@@ -428,8 +374,7 @@ async def list_objects(
                 name=obj.name,
                 content_type=obj.content_type,
                 size=obj.size,
-                created_at=str(obj.created_at),
-                owner=obj.owner
+                created_at=str(obj.created_at)
             ) for obj in objects
         ]
         
