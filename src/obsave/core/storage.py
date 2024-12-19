@@ -1,6 +1,6 @@
 """ObSave core storage module."""
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +9,7 @@ from threading import Lock
 import time
 from .exceptions import StorageError, ObjectNotFoundError
 from obsave.monitoring.metrics import metrics_collector
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -255,3 +256,44 @@ class ObjectStorage:
                 "errors": self.stats["errors"],
                 "retries": self.stats["retries"]
             }
+            
+    async def list_files(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """列出存储的文件"""
+        try:
+            async with self.semaphore:
+                def list_files_sync():
+                    files = []
+                    for root, _, filenames in os.walk(self.base_path):
+                        for filename in filenames:
+                            if filename.endswith('.tmp'):  # Skip temporary files
+                                continue
+                            file_path = os.path.join(root, filename)
+                            try:
+                                file_id = os.path.basename(file_path)
+                                file_size = os.path.getsize(file_path)
+                                file_time = os.path.getctime(file_path)
+                                
+                                files.append({
+                                    "id": file_id,
+                                    "name": filename,
+                                    "content_type": "application/json" if filename.endswith('.json') else "application/octet-stream",
+                                    "size": file_size,
+                                    "created_at": datetime.fromtimestamp(file_time).isoformat()
+                                })
+                            except OSError:
+                                continue
+                                
+                    # Sort by creation time, newest first
+                    files.sort(key=lambda x: x["created_at"], reverse=True)
+                    
+                    # Apply pagination
+                    return files[offset:offset + limit]
+                    
+                return await asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool,
+                    list_files_sync
+                )
+                
+        except Exception as e:
+            logger.error(f"Error listing files: {str(e)}")
+            raise StorageError(f"Failed to list files: {str(e)}")

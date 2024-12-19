@@ -67,3 +67,4 @@ wal/
 objectstorage_env/
 config/*.local.yaml
 *.local.env
+storage/
