@@ -1,35 +1,35 @@
 {
-  "timestamp": "2024-12-19T15:15:40.494871",
+  "timestamp": "2024-12-19T15:35:51.534538",
   "io_wait": {
-    "current": 110,
-    "avg": 110.0
+    "current": 1422254,
+    "avg": 1278675.892857143
   },
   "cpu_usage": {
-    "current": 0.0,
-    "avg": 0.051666666666666666
+    "current": 59.4,
+    "avg": 58.260714285714286
   },
   "memory_mapped": {
-    "current": 89075712,
-    "avg": 88849749.33333333
+    "current": 99115008,
+    "avg": 90669202.28571428
   },
   "write_throughput": {
-    "current": 218.89454264585387,
-    "peak": 4559.790045276964
+    "current": 718.5381360251987,
+    "peak": 327.8726251672858
   },
   "write_latency": {
-    "current": 228.42049598693848,
-    "avg": 52.78060202790733
+    "current": 680.5484294891357,
+    "avg": 29.37163559844208
   },
   "queue_size": {
-    "current": 150,
-    "avg": 178.83333333333334
+    "current": 489,
+    "avg": 504.5
   },
   "error_rate": {
     "current": 0.0,
     "total_errors": 0
   },
   "total_stats": {
-    "bytes_written": 278597,
-    "operations": 2500
+    "bytes_written": 599365,
+    "operations": 5378
   }
 }
