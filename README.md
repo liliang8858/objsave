@@ -17,12 +17,21 @@ ObjSave 是一个基于 FastAPI 的高性能对象存储服务，提供对象的
 - 发布日期：2024-12-19
 - Python 版本要求：>=3.8
 
+
 ## 快速开始
+
+### 创建虚拟环境
+python -m venv objectstorage_env
+
+### 激活虚拟环境
+objectstorage_env\Scripts\activate
+
 
 1. 安装依赖：
 ```bash
 pip install -r requirements.txt
 ```
+
 
 2. 启动服务：
 ```bash
