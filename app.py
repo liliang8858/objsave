@@ -1,7 +1,7 @@
 import os
 import uuid
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, APIRouter, Request, Response
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, APIRouter, Request, Response, BackgroundTasks
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -22,11 +22,19 @@ from fastapi.middleware.gzip import GZipMiddleware
 from models import ObjectStorage, ObjectMetadata
 from database import get_db, init_db
 from write_manager import WriteManager
+from config import settings
+from exceptions import ObjSaveException, ObjectNotFoundError, InvalidJSONPathError
+from monitoring import metrics, measure_time
+from backup import backup_manager
 
 # 配置日志记录
 logging.basicConfig(
-    level=logging.DEBUG,  # 改为DEBUG级别
-    format='%(asctime)s - %(levelname)s - [%(pathname)s:%(lineno)d] - %(message)s'
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(name)s:%(pathname)s:%(lineno)d] - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('objsave.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -40,33 +48,33 @@ CACHE_TTL = 3600
 
 # 创建线程池
 thread_pool = ThreadPoolExecutor(
-    max_workers=MAX_WORKERS * 2,
+    max_workers=settings.MAX_WORKERS * 2,
     thread_name_prefix="db_worker"
 )
 
 # 创建上传专用线程池
 upload_thread_pool = ThreadPoolExecutor(
-    max_workers=MAX_WORKERS,
+    max_workers=settings.MAX_WORKERS,
     thread_name_prefix="upload_worker"
 )
 
 # 创建存储管理器实例
 storage = StorageManager(
-    base_path="storage",
-    chunk_size=CHUNK_SIZE,
-    max_concurrent_ops=MAX_WORKERS
+    base_path=settings.STORAGE_BASE_PATH,
+    chunk_size=settings.CHUNK_SIZE,
+    max_concurrent_ops=settings.MAX_WORKERS
 )
 
 # 创建缓存管理器实例
 cache = CacheManager(
-    max_items=CACHE_MAX_ITEMS,
-    shards=CACHE_SHARDS,
-    ttl=CACHE_TTL
+    max_items=settings.CACHE_MAX_ITEMS,
+    shards=settings.CACHE_SHARDS,
+    ttl=settings.CACHE_TTL
 )
 
 # 创建请求队列实例
 request_queue = RequestQueue(
-    max_workers=MAX_WORKERS
+    max_workers=settings.MAX_WORKERS
 )
 
 # 全局写入管理器
@@ -80,8 +88,8 @@ write_manager = WriteManager(
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up server...")
-    logger.info(f"Available workers: {MAX_WORKERS}")
-    logger.info(f"Cache config: max_items={CACHE_MAX_ITEMS}, shards={CACHE_SHARDS}, ttl={CACHE_TTL}s")
+    logger.info(f"Available workers: {settings.MAX_WORKERS}")
+    logger.info(f"Cache config: max_items={settings.CACHE_MAX_ITEMS}, shards={settings.CACHE_SHARDS}, ttl={settings.CACHE_TTL}s")
     
     # 初始化数据库
     init_db()
@@ -105,7 +113,26 @@ async def lifespan(app: FastAPI):
 # 创建FastAPI应用
 app = FastAPI(
     title="ObjSave API",
-    description="高性能对象存储服务",
+    description="""
+    # ObjSave 对象存储服务
+
+    ObjSave是一个高性能的对象存储服务，提供以下主要功能：
+
+    ## 核心功能
+    * 文件上传和下载
+    * JSON对象存储和查询
+    * 数据备份和恢复
+    * 性能监控
+
+    ## 技术特点
+    * 高并发处理
+    * 异步IO操作
+    * 缓存优化
+    * 实时监控
+    
+    ## 使用说明
+    所有API端点都以 `/objsave` 为前缀。详细的API文档请参考下面的接口说明。
+    """,
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/objsave/docs",
@@ -114,7 +141,7 @@ app = FastAPI(
 )
 
 # 请求信号量，限制并发请求数
-request_semaphore = asyncio.Semaphore(MAX_WORKERS)
+request_semaphore = asyncio.Semaphore(settings.MAX_WORKERS)
 
 # 请求ID中间件
 @app.middleware("http")
@@ -158,6 +185,30 @@ app.add_middleware(
 
 # GZip中间件
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# 异常处理中间件
+@app.exception_handler(ObjSaveException)
+async def objsave_exception_handler(request: Request, exc: ObjSaveException):
+    logger.error(f"Request failed: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error_code": exc.error_code,
+            "detail": exc.detail
+        }
+    )
+
+# 全局异常处理
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception occurred")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error_code": "INTERNAL_ERROR",
+            "detail": "An internal server error occurred"
+        }
+    )
 
 # 创建路由器
 router = APIRouter(
@@ -316,78 +367,54 @@ async def health_check():
         )
 
 # 上传对象接口
-@router.post("/upload")
+@router.post("/objects", response_model=ObjectMetadata)
 async def upload_object(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    """上传对象到存储服务"""
-    try:
-        # 检查文件大小
-        if file.size and file.size > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=413, detail="File too large")
-            
-        content = await file.read()
+    async with measure_time("upload_object"):
+        if file.size and file.size > settings.MAX_UPLOAD_SIZE:
+            raise ObjSaveException(
+                status_code=413,
+                detail=f"File too large. Maximum size is {settings.MAX_UPLOAD_SIZE} bytes",
+                error_code="FILE_TOO_LARGE"
+            )
         
-        # 将上传任务加入队列
-        async def upload_task():
+        try:
             object_id = str(uuid.uuid4())
             
-            # 尝试存储到缓存
-            cache_stats = cache.get_stats()
-            if float(cache_stats['capacity_usage'].rstrip('%')) <= 90:
-                cache.set(object_id, content)
-                storage_type = "cache"
-            else:
-                storage.set(object_id, content)
-                storage_type = "storage"
-                
+            # 异步存储文件
+            storage_task = asyncio.create_task(
+                storage.store_file(object_id, file)
+            )
+            
+            # 创建元数据记录
             metadata = ObjectMetadata(
                 id=object_id,
                 name=file.filename,
                 content_type=file.content_type,
-                size=len(content),
-                created_at=datetime.now().isoformat()
+                size=file.size,
+                created_at=datetime.utcnow().isoformat()
             )
             
-            # 存储元数据到数据库
-            db_obj = ObjectStorage(
-                id=metadata.id,
-                name=metadata.name,
-                content_type=metadata.content_type,
-                size=metadata.size,
-                created_at=metadata.created_at
-            )
+            # 等待存储完成
+            await storage_task
             
-            db.add(db_obj)
-            db.commit()
+            # 写入数据库
+            await write_manager.write(metadata)
+            metrics.record("objects_uploaded_total", 1)
+            metrics.record("bytes_uploaded_total", file.size)
             
-            logger.info(f"Object {object_id} uploaded using {storage_type}")
             return metadata
             
-        # 将任务加入队列，优先处理小文件
-        priority = 0 if len(content) < 1024 * 1024 else 1  # 1MB以下的文件优先处理
-        task_id = await request_queue.enqueue(
-            upload_task,
-            priority=priority,
-            is_cpu_bound=len(content) > 5 * 1024 * 1024  # 5MB以上的文件使用线程池处理
-        )
-        
-        # 等待结果
-        while True:
-            result = request_queue.get_result(task_id)
-            if result:
-                if result["status"] == "completed":
-                    return result["result"]
-                elif result["status"] == "failed":
-                    raise HTTPException(status_code=500, detail=result["error"])
-            await asyncio.sleep(0.1)
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Upload failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="Upload failed")
+        except Exception as e:
+            logger.exception("Failed to upload object")
+            await storage.cleanup(object_id)
+            raise ObjSaveException(
+                status_code=500,
+                detail="Failed to upload object",
+                error_code="UPLOAD_FAILED"
+            ) from e
 
 # 下载对象接口
 @router.get("/download/{object_id}")
@@ -774,6 +801,88 @@ async def query_json_objects(
         logger.error(f"[{request_id}] Query failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# 监控相关API
+@router.get("/metrics", 
+    summary="获取系统指标",
+    description="获取系统性能指标，包括CPU使用率、内存使用情况、存储状态等",
+    response_description="返回所有收集的指标数据",
+    tags=["monitoring"])
+async def get_metrics():
+    """
+    获取系统性能指标
+    
+    返回以下指标：
+    * CPU使用率
+    * 内存使用情况
+    * 磁盘使用状态
+    * 请求处理统计
+    * 操作耗时统计
+    """
+    return metrics.get_metrics()
+
+# 备份相关API
+@router.post("/backups", 
+    summary="创建新备份",
+    description="创建系统数据的完整备份，包括存储的对象和数据库",
+    response_description="返回创建的备份信息",
+    tags=["backup"])
+async def create_backup(
+    background_tasks: BackgroundTasks,
+    backup_name: Optional[str] = None
+):
+    """
+    创建新的系统备份
+    
+    - **backup_name**: 可选的备份名称，如果不提供将自动生成
+    """
+    try:
+        backup_name = await backup_manager.create_backup(backup_name)
+        return {"message": "Backup started", "backup_name": backup_name}
+    except Exception as e:
+        raise ObjSaveException(
+            status_code=500,
+            detail=f"Failed to create backup: {str(e)}",
+            error_code="BACKUP_FAILED"
+        )
+
+@router.get("/backups", 
+    summary="列出所有备份",
+    description="获取所有可用备份的列表",
+    response_description="返回备份列表",
+    tags=["backup"])
+async def list_backups():
+    """
+    获取所有可用的备份列表
+    
+    返回每个备份的以下信息：
+    * 备份名称
+    * 创建时间
+    * 备份大小
+    * 状态
+    """
+    return await backup_manager.list_backups()
+
+@router.post("/backups/{backup_name}/restore", 
+    summary="恢复备份",
+    description="从指定的备份恢复系统数据",
+    response_description="返回恢复操作的结果",
+    tags=["backup"])
+async def restore_backup(backup_name: str):
+    """
+    从指定备份恢复系统
+    
+    - **backup_name**: 要恢复的备份名称
+    """
+    try:
+        success = await backup_manager.restore_backup(backup_name)
+        return {"message": "Backup restored successfully", "success": success}
+    except Exception as e:
+        raise ObjSaveException(
+            status_code=500,
+            detail=f"Failed to restore backup: {str(e)}",
+            error_code="RESTORE_FAILED"
+        )
+
 # 添加监控端点
 @router.get("/stats")
 async def get_write_stats():
@@ -783,16 +892,17 @@ async def get_write_stats():
 # 注册路由
 app.include_router(router)
 
-# 启动配置
+# 在应用启动时开始收集指标
+@app.on_event("startup")
+async def start_metrics_collector():
+    asyncio.create_task(start_metrics_collection())
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
         port=8000,
-        workers=1,  # 开发模式使用单进程
-        log_level="debug",
-        timeout_keep_alive=30,
-        loop="asyncio",
-        reload=True  # 开发模式启用热重载
+        reload=True,
+        workers=settings.MAX_WORKERS
     )

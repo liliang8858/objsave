@@ -1,35 +1,35 @@
 {
-  "timestamp": "2024-12-19T13:42:19.793797",
+  "timestamp": "2024-12-19T13:51:13.249218",
   "io_wait": {
     "current": 0,
     "avg": 0.0
   },
   "cpu_usage": {
     "current": 0.0,
-    "avg": 0.0
+    "avg": 0.025
   },
   "memory_mapped": {
-    "current": 60268544,
-    "avg": 60136448.0
+    "current": 181067776,
+    "avg": 181072554.66666666
   },
   "write_throughput": {
-    "current": 0,
-    "peak": 0
+    "current": 361.3231186340093,
+    "peak": 16656.154573257198
   },
   "write_latency": {
-    "current": 0,
-    "avg": 0
+    "current": 199.26762580871582,
+    "avg": 38.54868331891656
   },
   "queue_size": {
-    "current": 0,
-    "avg": 0
+    "current": 472,
+    "avg": 442.5
   },
   "error_rate": {
-    "current": 0,
+    "current": 0.0,
     "total_errors": 0
   },
   "total_stats": {
-    "bytes_written": 0,
-    "operations": 0
+    "bytes_written": 4184023,
+    "operations": 37544
   }
 }
