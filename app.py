@@ -198,24 +198,122 @@ class JSONObjectResponse(BaseModel):
 # 健康检查接口
 @router.get("/health")
 async def health_check():
-    """系统健康检查"""
+    """健康检查接口，返回系统状态和性能指标"""
     try:
-        cache_stats = cache.get_stats()
-        storage_stats = storage.get_stats()
-        queue_stats = request_queue.get_stats()
+        # 获取写入管理器状态
+        write_stats = write_manager.get_stats()
+        metrics = write_manager.metrics.get_metrics()
         
-        return {
-            "status": "healthy",
-            "cache": cache_stats,
-            "storage": storage_stats,
-            "queue": queue_stats,
+        # 系统状态评估
+        status = "healthy"
+        alerts = []
+        
+        # 检查写入延迟
+        current_latency = metrics['write_latency']['current']
+        avg_latency = metrics['write_latency']['avg']
+        if current_latency > avg_latency * 3:
+            alerts.append({
+                "level": "warning",
+                "message": f"High write latency: {current_latency:.2f}ms (avg: {avg_latency:.2f}ms)"
+            })
+            status = "degraded"
+            
+        # 检查吞吐量
+        current_throughput = metrics['write_throughput']['current']
+        peak_throughput = metrics['write_throughput']['peak']
+        if current_throughput < peak_throughput * 0.5:
+            alerts.append({
+                "level": "warning",
+                "message": f"Low throughput: {current_throughput:.2f}B/s (peak: {peak_throughput:.2f}B/s)"
+            })
+            status = "degraded"
+            
+        # 检查CPU使用率
+        cpu_usage = metrics['cpu_usage']['current']
+        if cpu_usage > 80:
+            alerts.append({
+                "level": "warning",
+                "message": f"High CPU usage: {cpu_usage:.1f}%"
+            })
+            status = "degraded"
+            
+        # 检查队列积压
+        queue_size = metrics['queue_size']['current']
+        if queue_size > write_manager.max_queue_size * 0.8:
+            alerts.append({
+                "level": "warning",
+                "message": f"Queue near capacity: {queue_size}/{write_manager.max_queue_size}"
+            })
+            status = "degraded"
+            
+        # 检查错误率
+        error_rate = metrics['error_rate']['current']
+        if error_rate > 0.05:  # 5%错误率阈值
+            alerts.append({
+                "level": "critical",
+                "message": f"High error rate: {error_rate*100:.1f}%"
+            })
+            status = "unhealthy"
+            
+        # 构建健康检查响应
+        health_response = {
+            "status": status,
+            "timestamp": datetime.now().isoformat(),
+            "version": "1.0.0",  # 应用版本
+            
+            # 系统状态
             "system": {
-                "workers": MAX_WORKERS
+                "cpu_usage": metrics['cpu_usage'],
+                "memory_mapped": {
+                    "current": metrics['memory_mapped']['current'] / (1024*1024),  # 转换为MB
+                    "avg": metrics['memory_mapped']['avg'] / (1024*1024)
+                },
+                "io_wait": metrics['io_wait']
+            },
+            
+            # 写入性能
+            "write_performance": {
+                "latency_ms": metrics['write_latency'],
+                "throughput_bps": metrics['write_throughput'],
+                "queue_size": metrics['queue_size'],
+                "error_rate": metrics['error_rate']
+            },
+            
+            # 累计统计
+            "statistics": {
+                "total_bytes_written": metrics['total_stats']['bytes_written'],
+                "total_operations": metrics['total_stats']['operations'],
+                "total_errors": metrics['error_rate']['total_errors']
+            },
+            
+            # 告警信息
+            "alerts": alerts,
+            
+            # 缓存状态
+            "cache": {
+                "size": len(write_manager.cache),
+                "max_size": write_manager.max_queue_size
             }
         }
+        
+        # 设置响应状态码
+        status_code = 200 if status == "healthy" else 503 if status == "unhealthy" else 200
+        
+        return JSONResponse(
+            content=health_response,
+            status_code=status_code
+        )
+        
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="Health check failed")
+        return JSONResponse(
+            content={
+                "status": "error",
+                "timestamp": datetime.now().isoformat(),
+                "error": str(e)
+            },
+            status_code=500
+        )
 
 # 上传对象接口
 @router.post("/upload")
@@ -431,15 +529,10 @@ async def upload_json_object(
             'owner': None
         }
         
-        # 添加到写入队列
+        # 添加到写入队列 - 不等待确认
         try:
             await write_manager.add_record(record)
-            logger.debug(f"[{request_id}] Record added to write queue")
-            
-            # 等待写入确认
-            if not await write_manager.wait_for_confirm(object_id, timeout=5.0):
-                logger.warning(f"[{request_id}] Write confirmation timeout")
-                
+            logger.debug(f"[{request_id}] Record queued for writing")
         except Exception as e:
             logger.error(f"[{request_id}] Write queue error: {str(e)}")
             raise HTTPException(status_code=500, detail="Write queue error")
@@ -454,7 +547,7 @@ async def upload_json_object(
             type=record['type']
         )
         
-        logger.info(f"[{request_id}] Upload completed successfully")
+        logger.info(f"[{request_id}] Upload queued successfully")
         return metadata
         
     except HTTPException:

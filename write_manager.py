@@ -9,11 +9,16 @@ from models import ObjectStorage
 from database import SessionLocal
 import threading
 import time
+import os
+import aiofiles
+import hashlib
+from zero_copy import ZeroCopyWriter
+from monitor import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
 class WriteManager:
-    """写入管理器 - 使用Write-Behind策略"""
+    """写入管理器 - 使用Write-Behind策略和零拷贝技术"""
     
     def __init__(self, 
                  batch_size: int = 100,
@@ -26,23 +31,22 @@ class WriteManager:
         # 写入队列 - 使用双端队列提高性能
         self.write_queue = deque(maxlen=max_queue_size)
         
-        # 确认队列 - 存储已写入数据库的记录ID
-        self.confirm_queue = set()
-        
         # 内存缓存 - 用于快速查询
         self.cache = {}
+        
+        # WAL目录
+        self.wal_dir = "./wal"
+        os.makedirs(self.wal_dir, exist_ok=True)
+        
+        # 零拷贝写入器
+        self.zero_copy = ZeroCopyWriter()
+        
+        # 性能监控器
+        self.metrics = MetricsCollector()
         
         # 控制标志
         self._running = False
         self._flush_event = asyncio.Event()
-        
-        # 统计信息
-        self.stats = {
-            'total_writes': 0,
-            'successful_writes': 0,
-            'failed_writes': 0,
-            'avg_write_time': 0
-        }
         
         # 锁
         self._queue_lock = asyncio.Lock()
@@ -54,6 +58,11 @@ class WriteManager:
             return
             
         self._running = True
+        # 启动监控
+        await self.metrics.start()
+        # 恢复WAL
+        await self._recover_from_wal()
+        # 启动后台刷新任务
         asyncio.create_task(self._flush_loop())
         logger.info("Write manager started")
         
@@ -65,47 +74,131 @@ class WriteManager:
         self._running = False
         self._flush_event.set()
         await self._flush_to_db(force=True)  # 强制刷新所有数据
+        await self.metrics.stop()  # 停止监控
+        self.zero_copy.cleanup()
+        
+        # 保存监控数据
+        self.metrics.save_metrics("write_metrics.json")
         logger.info("Write manager stopped")
         
     async def add_record(self, record: Dict[str, Any]) -> str:
         """添加记录到写入队列"""
-        async with self._queue_lock:
-            if len(self.write_queue) >= self.max_queue_size:
-                await self._flush_to_db(force=True)
-                
-            # 添加到写入队列
-            self.write_queue.append(record)
+        start_time = time.time()
+        try:
+            # 写入WAL
+            await self._write_to_wal(record)
             
-            # 更新内存缓存
-            async with self._cache_lock:
-                self.cache[record['id']] = record
+            async with self._queue_lock:
+                if len(self.write_queue) >= self.max_queue_size:
+                    self._flush_event.set()  # 触发刷新，但不等待
+                    
+                # 添加到写入队列
+                self.write_queue.append(record)
                 
-            # 如果队列达到批处理大小，触发刷新
-            if len(self.write_queue) >= self.batch_size:
-                self._flush_event.set()
+                # 更新内存缓存
+                async with self._cache_lock:
+                    self.cache[record['id']] = record
+                    
+                # 记录队列大小
+                self.metrics.record_queue_size(len(self.write_queue))
                 
+            # 记录写入操作
+            write_time = time.time() - start_time
+            self.metrics.record_write(
+                size=len(json.dumps(record).encode('utf-8')),
+                latency=write_time * 1000,  # 转换为毫秒
+                success=True
+            )
+            
             return record['id']
+            
+        except Exception as e:
+            # 记录失败操作
+            write_time = time.time() - start_time
+            self.metrics.record_write(
+                size=len(json.dumps(record).encode('utf-8')),
+                latency=write_time * 1000,
+                success=False
+            )
+            raise
             
     async def get_record(self, record_id: str) -> Dict[str, Any]:
         """从缓存获取记录"""
         async with self._cache_lock:
             return self.cache.get(record_id)
             
+    async def _write_to_wal(self, record: Dict[str, Any]):
+        """使用零拷贝写入WAL文件"""
+        wal_entry = {
+            'timestamp': time.time(),
+            'record': record
+        }
+        
+        # 使用记录ID和时间戳生成WAL文件名
+        filename = f"{record['id']}_{int(time.time()*1000)}.wal"
+        filepath = os.path.join(self.wal_dir, filename)
+        
+        try:
+            # 将数据序列化为字节
+            data = json.dumps(wal_entry).encode('utf-8')
+            
+            # 使用零拷贝写入
+            await self.zero_copy.write_file(filepath, data)
+            
+        except Exception as e:
+            logger.error(f"Failed to write WAL: {str(e)}")
+            raise
+            
+    async def _recover_from_wal(self):
+        """从WAL恢复数据"""
+        try:
+            wal_files = sorted(os.listdir(self.wal_dir))
+            for filename in wal_files:
+                if not filename.endswith('.wal'):
+                    continue
+                    
+                filepath = os.path.join(self.wal_dir, filename)
+                try:
+                    # 使用零拷贝读取
+                    with open(filepath, 'rb') as f:
+                        content = f.read()  # 文件已经在内存映射中
+                    wal_entry = json.loads(content.decode('utf-8'))
+                    record = wal_entry['record']
+                    self.write_queue.append(record)
+                    self.cache[record['id']] = record
+                    
+                except Exception as e:
+                    logger.error(f"Failed to recover WAL {filename}: {str(e)}")
+                    
+                # 处理完后删除WAL文件
+                try:
+                    os.remove(filepath)
+                except Exception as e:
+                    logger.error(f"Failed to delete WAL {filename}: {str(e)}")
+                    
+        except Exception as e:
+            logger.error(f"WAL recovery failed: {str(e)}")
+            
     async def _flush_loop(self):
         """后台刷新循环"""
         while self._running:
             try:
                 # 等待刷新信号或超时
-                await asyncio.wait_for(
-                    self._flush_event.wait(),
-                    timeout=self.flush_interval
-                )
-            except asyncio.TimeoutError:
-                pass
+                try:
+                    await asyncio.wait_for(
+                        self._flush_event.wait(),
+                        timeout=self.flush_interval
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                    
+                self._flush_event.clear()
+                await self._flush_to_db()
                 
-            self._flush_event.clear()
-            await self._flush_to_db()
-            
+            except Exception as e:
+                logger.error(f"Flush loop error: {str(e)}")
+                await asyncio.sleep(1)  # 错误后等待
+                
     async def _flush_to_db(self, force: bool = False):
         """将数据刷新到数据库"""
         if not self.write_queue and not force:
@@ -152,18 +245,23 @@ class WriteManager:
                 session.bulk_save_objects(db_objects)
                 session.commit()
                 
-                # 更新确认队列
+                # 删除对应的WAL文件
                 for record in records:
-                    self.confirm_queue.add(record['id'])
-                    
+                    wal_pattern = f"{record['id']}_*.wal"
+                    for filename in os.listdir(self.wal_dir):
+                        if filename.startswith(record['id']):
+                            try:
+                                os.remove(os.path.join(self.wal_dir, filename))
+                            except Exception as e:
+                                logger.error(f"Failed to delete WAL {filename}: {str(e)}")
+                                
                 # 更新统计信息
                 write_time = time.time() - start_time
-                self.stats['total_writes'] += len(records)
-                self.stats['successful_writes'] += len(records)
-                self.stats['avg_write_time'] = (
-                    self.stats['avg_write_time'] * (self.stats['total_writes'] - len(records)) +
-                    write_time * len(records)
-                ) / self.stats['total_writes']
+                self.metrics.record_flush(
+                    size=len(records),
+                    latency=write_time * 1000,  # 转换为毫秒
+                    success=True
+                )
                 
                 logger.info(f"Successfully wrote {len(records)} records to database in {write_time:.2f}s")
                 
@@ -176,7 +274,11 @@ class WriteManager:
                     for record in reversed(records):
                         self.write_queue.appendleft(record)
                         
-                self.stats['failed_writes'] += len(records)
+                self.metrics.record_flush(
+                    size=len(records),
+                    latency=(time.time() - start_time) * 1000,
+                    success=False
+                )
                 raise
                 
             finally:
@@ -187,20 +289,10 @@ class WriteManager:
             # 触发重试
             self._flush_event.set()
             
-    async def wait_for_confirm(self, record_id: str, timeout: float = 5.0) -> bool:
-        """等待记录写入确认"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if record_id in self.confirm_queue:
-                return True
-            await asyncio.sleep(0.1)
-        return False
-        
     def get_stats(self) -> Dict[str, Any]:
         """获取写入统计信息"""
         return {
             'queue_size': len(self.write_queue),
             'cache_size': len(self.cache),
-            'confirmed_writes': len(self.confirm_queue),
-            **self.stats
+            **self.metrics.get_metrics()
         }

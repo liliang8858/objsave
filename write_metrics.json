@@ -1,0 +1,35 @@
+{
+  "timestamp": "2024-12-19T11:52:47.707113",
+  "io_wait": {
+    "current": 0,
+    "avg": 0.0
+  },
+  "cpu_usage": {
+    "current": 0.0,
+    "avg": 0.0
+  },
+  "memory_mapped": {
+    "current": 0,
+    "avg": 0
+  },
+  "write_throughput": {
+    "current": 0,
+    "peak": 0
+  },
+  "write_latency": {
+    "current": 0,
+    "avg": 0
+  },
+  "queue_size": {
+    "current": 0,
+    "avg": 0
+  },
+  "error_rate": {
+    "current": 0,
+    "total_errors": 0
+  },
+  "total_stats": {
+    "bytes_written": 0,
+    "operations": 0
+  }
+}
