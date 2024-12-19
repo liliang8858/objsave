@@ -1,6 +1,6 @@
-"""Monitoring and metrics for ObSave."""
+"""ObSave monitoring module."""
 
-from .metrics import MetricsCollector
-from .health import HealthCheck
+from .metrics import metrics_collector
+from .middleware import PrometheusMiddleware
 
-__all__ = ["MetricsCollector", "HealthCheck"]
+__all__ = ['metrics_collector', 'PrometheusMiddleware']

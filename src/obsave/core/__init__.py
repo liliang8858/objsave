@@ -1,6 +1,6 @@
-"""Core functionality for ObSave."""
+"""ObSave core module."""
 
 from .storage import ObjectStorage
-from .exceptions import ObjectStorageError
+from .exceptions import StorageError, ObjectNotFoundError
 
-__all__ = ["ObjectStorage", "ObjectStorageError"]
+__all__ = ['ObjectStorage', 'StorageError', 'ObjectNotFoundError']
