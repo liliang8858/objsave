@@ -24,26 +24,34 @@ from database import get_db, init_db
 
 # 配置日志记录
 logging.basicConfig(
-    level=logging.INFO,  # 生产环境推荐INFO级别
-    format='%(asctime)s - %(levelname)s - [%(pathname)s:%(lineno)d] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    level=logging.DEBUG,  # 改为DEBUG级别
+    format='%(asctime)s - %(levelname)s - [%(pathname)s:%(lineno)d] - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 # 系统配置
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
-MAX_WORKERS = min(32, multiprocessing.cpu_count() * 4)  # 增加工作线程数
-CHUNK_SIZE = 64 * 1024  # 增加到64KB以提高传输效率
-CACHE_MAX_ITEMS = 20000  # 增加缓存容量
-CACHE_SHARDS = 32  # 增加分片数减少锁竞争
-CACHE_TTL = 3600  # 缓存过期时间（秒）
+MAX_WORKERS = min(32, multiprocessing.cpu_count() * 4)
+CHUNK_SIZE = 64 * 1024  # 64KB chunks
+CACHE_MAX_ITEMS = 20000
+CACHE_SHARDS = 32
+CACHE_TTL = 3600
 
 # 创建线程池
-thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+thread_pool = ThreadPoolExecutor(
+    max_workers=MAX_WORKERS * 2,
+    thread_name_prefix="db_worker"
+)
+
+# 创建上传专用线程池
+upload_thread_pool = ThreadPoolExecutor(
+    max_workers=MAX_WORKERS,
+    thread_name_prefix="upload_worker"
+)
 
 # 创建存储管理器实例
 storage = StorageManager(
-    base_path="storage",  # 存储目录
+    base_path="storage",
     chunk_size=CHUNK_SIZE,
     max_concurrent_ops=MAX_WORKERS
 )
@@ -72,31 +80,12 @@ async def lifespan(app: FastAPI):
     
     # 启动请求队列处理器
     await request_queue.start()
+    yield
     
-    # 定期清理过期缓存
-    async def cache_cleanup():
-        while True:
-            try:
-                cache.cleanup_expired()
-                await asyncio.sleep(300)  # 每5分钟清理一次
-            except Exception as e:
-                logger.error(f"Cache cleanup error: {str(e)}")
-                await asyncio.sleep(60)  # 出错后等待1分钟再试
-                
-    # 启动缓存清理任务
-    asyncio.create_task(cache_cleanup())
-    
-    try:
-        yield
-    except Exception as e:
-        logger.error(f"Server error: {str(e)}")
-    finally:
-        # Shutdown
-        logger.info("Shutting down server...")
-        await asyncio.sleep(1)
-        thread_pool.shutdown(wait=True)
-        storage.clear()
-        logger.info("Server shutdown complete")
+    # Shutdown
+    logger.info("Shutting down...")
+    thread_pool.shutdown(wait=False)
+    upload_thread_pool.shutdown(wait=False)
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -109,10 +98,37 @@ app = FastAPI(
     openapi_url="/objsave/openapi.json"
 )
 
-# 添加GZip压缩
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# 请求ID中间件
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    logger.info(f"[{request_id}] Request started: {request.method} {request.url.path}")
+    
+    try:
+        response = await call_next(request)
+        logger.info(f"[{request_id}] Request completed")
+        return response
+    except Exception as e:
+        logger.error(f"[{request_id}] Request failed: {str(e)}")
+        raise
 
-# 配置CORS
+# 超时中间件
+@app.middleware("http")
+async def timeout_middleware(request: Request, call_next):
+    try:
+        return await asyncio.wait_for(
+            call_next(request),
+            timeout=30
+        )
+    except asyncio.TimeoutError:
+        logger.error("Request timeout")
+        return JSONResponse(
+            status_code=408,
+            content={"detail": "Request timeout"}
+        )
+
+# CORS中间件
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -121,8 +137,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# GZip中间件
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 # 创建路由器
-router = APIRouter(prefix="/objsave")
+router = APIRouter(
+    prefix="/objsave",
+    tags=["object-storage"]
+)
 
 # 对象元数据模型
 class ObjectMetadata(BaseModel):
@@ -142,13 +164,6 @@ class JSONObjectModel(BaseModel):
     name: Optional[str] = None
     content_type: str = "application/json"
 
-# JSON 查询模型
-class JSONQueryModel(BaseModel):
-    jsonpath: str
-    value: Optional[Any] = None
-    operator: Optional[str] = 'eq'
-    type: Optional[str] = None
-
 # JSON对象响应模型
 class JSONObjectResponse(BaseModel):
     id: str
@@ -160,58 +175,6 @@ class JSONObjectResponse(BaseModel):
     content: Dict[str, Any]
 
     model_config = ConfigDict(from_attributes=True)
-
-# 安全中间件 - 简化版
-@app.middleware("http")
-async def security_middleware(request: Request, call_next):
-    try:
-        # 基本请求验证
-        if request.method in ["POST", "PUT"]:
-            try:
-                body = await request.json()
-            except:
-                pass  # 非JSON请求体，跳过验证
-                
-        response = await call_next(request)
-        return response
-        
-    except Exception as e:
-        logger.error(f"Security middleware error: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Internal server error"}
-        )
-
-# 性能监控中间件
-@app.middleware("http")
-async def performance_middleware(request: Request, call_next):
-    try:
-        start_time = time.time()
-        
-        # 检查系统负载
-        cache_stats = cache.get_stats()
-        if float(cache_stats['capacity_usage'].rstrip('%')) > 90:
-            logger.warning(f"High cache usage: {cache_stats['capacity_usage']}")
-            storage_stats = storage.get_stats()
-            logger.info(f"Storage stats: {storage_stats}")
-            
-        response = await call_next(request)
-        process_time = time.time() - start_time
-        
-        # 添加性能指标
-        response.headers["X-Process-Time"] = str(process_time)
-        
-        # 记录慢请求
-        if process_time > 1.0:
-            logger.warning(f"Slow request: {request.url.path} took {process_time:.2f}s")
-            
-        return response
-    except Exception as e:
-        logger.error(f"Performance middleware error: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Internal server error"}
-        )
 
 # 健康检查接口
 @router.get("/health")
@@ -414,61 +377,86 @@ async def list_objects(
 # JSON对象上传接口
 @router.post("/upload/json", response_model=ObjectMetadata)
 async def upload_json_object(
-    json_data: JSONObjectModel, 
+    request: Request,
+    json_data: JSONObjectModel,
     db: Session = Depends(get_db)
 ):
     """上传JSON对象"""
+    request_id = request.state.request_id
+    logger.debug(f"[{request_id}] Processing JSON upload")
+    
     try:
+        # 解析请求体
         content_str = json.dumps(json_data.content)
-        if len(content_str.encode('utf-8')) > 10 * 1024 * 1024:  # 10MB限制
-            raise HTTPException(status_code=413, detail="JSON content too large")
-            
+        content_size = len(content_str.encode('utf-8'))
+        logger.debug(f"[{request_id}] Content size: {content_size} bytes")
+        
+        # 检查大小限制
+        if content_size > 10 * 1024 * 1024:
+            logger.warning(f"[{request_id}] Content too large")
+            raise HTTPException(status_code=413, detail="Content too large")
+        
+        # 准备数据
         object_id = str(uuid.uuid4())
-        current_time = datetime.now().isoformat()
+        current_time = datetime.now()  # 使用datetime对象而不是字符串
         
-        def db_operation():
-            try:
-                obj = ObjectStorage(
-                    id=object_id,
-                    name=json_data.name or object_id,
-                    content=content_str,
-                    content_type='application/json',
-                    type=json_data.type,
-                    size=len(content_str),
-                    created_at=current_time
-                )
-                db.add(obj)
-                db.commit()
-                db.refresh(obj)
-                return obj
-            except Exception as e:
-                db.rollback()
-                raise e
-                
-        db_object = await asyncio.get_event_loop().run_in_executor(
-            thread_pool, 
-            db_operation
-        )
+        # 同步数据库操作
+        logger.debug(f"[{request_id}] Starting database operation")
+        try:
+            obj = ObjectStorage(
+                id=object_id,
+                name=json_data.name or object_id,
+                content=content_str,
+                content_type='application/json',
+                type=json_data.type,
+                size=content_size,
+                created_at=current_time,  # 使用datetime对象
+                owner=None
+            )
+            db.add(obj)
+            db.commit()
+            logger.debug(f"[{request_id}] Database commit successful")
+            db.refresh(obj)
+        except Exception as e:
+            logger.error(f"[{request_id}] Database error: {str(e)}")
+            db.rollback()
+            raise HTTPException(status_code=500, detail="Database error")
         
+        # 准备响应
         metadata = ObjectMetadata(
-            id=db_object.id,
-            name=db_object.name,
-            content_type=db_object.content_type,
-            size=db_object.size,
-            created_at=str(db_object.created_at)
+            id=obj.id,
+            name=obj.name,
+            content_type=obj.content_type,
+            size=obj.size,
+            created_at=obj.created_at.isoformat(),  # 转换为ISO格式字符串
+            type=obj.type
         )
         
-        # 缓存元数据和内容
-        cache.set(f"metadata:{db_object.id}", metadata.dict())
-        cache.set(f"content:{db_object.id}", json_data.content)
+        # 异步缓存操作
+        try:
+            logger.debug(f"[{request_id}] Starting cache operation")
+            await asyncio.wait_for(
+                asyncio.gather(
+                    asyncio.to_thread(lambda: cache.set(f"metadata:{object_id}", metadata.dict())),
+                    asyncio.to_thread(lambda: cache.set(f"content:{object_id}", json_data.content))
+                ),
+                timeout=5
+            )
+            logger.debug(f"[{request_id}] Cache operation completed")
+        except asyncio.TimeoutError:
+            logger.warning(f"[{request_id}] Cache operation timed out")
+        except Exception as e:
+            logger.error(f"[{request_id}] Cache error: {str(e)}")
         
+        logger.info(f"[{request_id}] Upload completed successfully")
         return metadata
         
-    except HTTPException:
+    except HTTPException as he:
+        logger.error(f"[{request_id}] HTTP error: {str(he)}")
         raise
     except Exception as e:
-        logger.error(f"Failed to upload JSON object: {str(e)}")
-        raise HTTPException(status_code=422, detail=str(e))
+        logger.error(f"[{request_id}] Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # JSON对象批量上传接口
 @router.post("/upload/json/batch", response_model=List[ObjectMetadata])
@@ -477,283 +465,230 @@ async def upload_json_objects_batch(
     db: Session = Depends(get_db)
 ):
     """批量上传JSON对象"""
+    request_id = str(uuid.uuid4())
+    logger.debug(f"[{request_id}] Starting batch upload of {len(json_objects)} objects")
+    
     try:
-        # 存储所有对象并收集元数据
         metadata_list = []
-        
         db_objects = []
+        
+        # 准备所有对象
         for json_data in json_objects:
-            # 序列化JSON数据
-            content = json.dumps(json_data.content, ensure_ascii=False).encode('utf-8')
+            content_str = json.dumps(json_data.content)
+            content_size = len(content_str.encode('utf-8'))
             
-            # 创建新的存储对象
+            if content_size > 10 * 1024 * 1024:  # 10MB限制
+                logger.warning(f"[{request_id}] Object too large: {content_size} bytes")
+                continue
+                
             db_object = ObjectStorage(
-                id=json_data.id or str(uuid.uuid4()),
+                id=str(uuid.uuid4()),
                 name=json_data.name or f"json_object_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                content=content,
+                content=content_str,
                 content_type="application/json",
                 type=json_data.type,
-                size=len(content)
+                size=content_size,
+                created_at=datetime.now().isoformat()
             )
             db_objects.append(db_object)
         
-        # 保存到数据库
-        def db_operation():
-            try:
-                db.add_all(db_objects)
-                db.commit()
-                return db_objects
-            except Exception as e:
-                db.rollback()
-                raise e
-
-        db_objects = await asyncio.get_event_loop().run_in_executor(
-            thread_pool, 
-            db_operation
-        )
-        
-        for db_object in db_objects:
-            metadata_list.append(ObjectMetadata(
-                id=db_object.id,
-                name=db_object.name,
-                content_type=db_object.content_type,
-                size=db_object.size,
-                created_at=str(db_object.created_at)
-            ))
-        
-        # 缓存元数据
-        for metadata in metadata_list:
-            cache.set(f"metadata:{metadata.id}", metadata.dict())
-        
+        # 数据库操作
+        logger.debug(f"[{request_id}] Starting database transaction")
+        try:
+            db.add_all(db_objects)
+            db.commit()
+            logger.debug(f"[{request_id}] Database transaction successful")
+            
+            # 创建元数据列表
+            for obj in db_objects:
+                metadata = ObjectMetadata(
+                    id=obj.id,
+                    name=obj.name,
+                    content_type=obj.content_type,
+                    size=obj.size,
+                    created_at=str(obj.created_at)
+                )
+                metadata_list.append(metadata)
+                
+                # 异步缓存
+                try:
+                    cache.set(f"metadata:{obj.id}", metadata.dict())
+                except Exception as e:
+                    logger.error(f"[{request_id}] Cache error for object {obj.id}: {str(e)}")
+                    
+        except Exception as e:
+            logger.error(f"[{request_id}] Database error: {str(e)}")
+            db.rollback()
+            raise HTTPException(status_code=500, detail="Database error")
+            
+        logger.info(f"[{request_id}] Successfully uploaded {len(metadata_list)} objects")
         return metadata_list
-    
+        
     except Exception as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        logger.error(f"[{request_id}] Batch upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # JSON对象更新接口
 @router.put("/update/json/{object_id}", response_model=ObjectMetadata)
 async def update_json_object(
     object_id: str,
-    json_data: JSONObjectModel, 
+    json_data: JSONObjectModel,
     db: Session = Depends(get_db)
 ):
     """更新指定ID的JSON对象"""
+    request_id = str(uuid.uuid4())
+    logger.debug(f"[{request_id}] Updating object {object_id}")
+    
     try:
-        # 查找现有对象
-        def db_operation():
-            return db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
-            
-        db_object = await asyncio.get_event_loop().run_in_executor(
-            thread_pool, 
-            db_operation
-        )
-        
+        # 查找对象
+        db_object = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
         if not db_object:
-            raise HTTPException(status_code=404, detail="对象未找到")
-        
-        # 序列化新的JSON数据
-        content = json.dumps(json_data.content).encode('utf-8')
-        
+            logger.warning(f"[{request_id}] Object {object_id} not found")
+            raise HTTPException(status_code=404, detail="Object not found")
+            
         # 更新对象
-        db_object.content = content
-        db_object.name = json_data.name or db_object.name
-        db_object.size = len(content)
+        content_str = json.dumps(json_data.content)
+        content_size = len(content_str.encode('utf-8'))
         
-        # 提交更改
-        def db_operation():
-            try:
-                db.commit()
-                db.refresh(db_object)
-                return db_object
-            except Exception as e:
-                db.rollback()
-                raise e
-
-        db_object = await asyncio.get_event_loop().run_in_executor(
-            thread_pool, 
-            db_operation
-        )
-        
-        # 缓存元数据和内容
-        cache.set(f"metadata:{db_object.id}", ObjectMetadata(
-            id=db_object.id,
-            name=db_object.name,
-            content_type=db_object.content_type,
-            size=db_object.size,
-            created_at=str(db_object.created_at)
-        ).dict())
-        cache.set(f"content:{db_object.id}", json_data.content)
-        
-        return ObjectMetadata(
+        if content_size > 10 * 1024 * 1024:  # 10MB限制
+            logger.warning(f"[{request_id}] Content too large: {content_size} bytes")
+            raise HTTPException(status_code=413, detail="Content too large")
+            
+        try:
+            db_object.content = content_str
+            db_object.name = json_data.name or db_object.name
+            db_object.size = content_size
+            db_object.type = json_data.type
+            
+            db.commit()
+            db.refresh(db_object)
+            logger.debug(f"[{request_id}] Database update successful")
+            
+        except Exception as e:
+            logger.error(f"[{request_id}] Database error: {str(e)}")
+            db.rollback()
+            raise HTTPException(status_code=500, detail="Database error")
+            
+        # 更新缓存
+        metadata = ObjectMetadata(
             id=db_object.id,
             name=db_object.name,
             content_type=db_object.content_type,
             size=db_object.size,
             created_at=str(db_object.created_at)
         )
-    
+        
+        try:
+            cache.set(f"metadata:{object_id}", metadata.dict())
+            cache.set(f"content:{object_id}", json_data.content)
+        except Exception as e:
+            logger.error(f"[{request_id}] Cache error: {str(e)}")
+            
+        logger.info(f"[{request_id}] Successfully updated object {object_id}")
+        return metadata
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        logger.error(f"[{request_id}] Update failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# JSON对象查询接口
-@router.post("/query/json", response_model=List[JSONObjectResponse])
-async def query_json_objects(
-    query: JSONQueryModel, 
-    db: Session = Depends(get_db),
-    limit: Optional[int] = 100,
-    offset: Optional[int] = 0
-):
-    """根据 JSONPath 查询和过滤 JSON 对象"""
-    try:
-        logger.debug(f"Querying JSON objects with path: {query.jsonpath}, value: {query.value}, operator: {query.operator}")
-        
-        # 验证 JSONPath 表达式
-        if not validate_jsonpath(query.jsonpath):
-            raise ValueError(f"Invalid JSONPath expression: {query.jsonpath}. JSONPath must start with '$'")
-        
-        # 解析 JSONPath 表达式中的条件
-        def extract_condition_from_jsonpath(path: str) -> tuple:
-            """从 JSONPath 表达式中提取条件
-            例如: $[?(@.type=="idea")] -> ("type", "idea")
-            """
-            import re
-            # 匹配 JSONPath 条件表达式
-            pattern = r'\$\[\?\(@\.(\w+)==["\'](.+)["\']\)\]'
-            match = re.match(pattern, path)
-            if match:
-                return match.groups()
-            return None, None
-
-        # 构建基础查询
-        base_query = db.query(ObjectStorage).filter(
-            ObjectStorage.content_type == "application/json"
-        )
-        
-        # 从 JSONPath 中提取查询条件
-        field, value = extract_condition_from_jsonpath(query.jsonpath)
-        if field and value:
-            # 将 JSONPath 条件转换为 SQL 查询
-            base_query = base_query.filter(getattr(ObjectStorage, field) == value)
-        elif query.type:  # 如果没有 JSONPath 条件但有 type 参数
-            base_query = base_query.filter(ObjectStorage.type == query.type)
-            
-        # 打印 SQL 查询语句
-        logger.debug(f"SQL Query: {base_query.statement}")
-            
-        # 执行分页查询    
-        def db_operation():
-            return base_query.offset(offset).limit(limit).all()
-            
-        objects = await asyncio.get_event_loop().run_in_executor(
-            thread_pool, 
-            db_operation
-        )
-        
-        # 打印查询到的对象
-        logger.debug("Query results:")
-        for obj in objects:
-            logger.debug(f"Object: {obj.__dict__}")
-            
-        logger.debug(f"Found {len(objects)} JSON objects before filtering")
-        logger.debug(f"Query JSONPath: {query.jsonpath}")
-        
-        # 打印每个对象的关键信息
-        for obj in objects:
-            try:
-                content = json.loads(obj.content)
-                logger.debug(f"Object[{obj.id}] - Type: {obj.type}, Content：field: {content}")
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse JSON content for object ID: {obj.id}")
-                continue
-        
-        # 使用 JSONPath 和条件过滤
-        matched_objects = []
-        
-        for obj in objects:
-            try:
-                # 解析JSON内容
-                content = json.loads(obj.content)
-                matched_objects.append((obj, content))
-                logger.debug("Matched objects:")
-                for obj2, content2 in matched_objects:
-                    logger.debug(f"Object[{obj2.id}] - Type: {obj2.type}, Content: {content2}")
-
-                
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse JSON content for object ID: {obj.id}")
-                continue
-            except Exception as e:
-                logger.error(f"Error processing object {obj.id}: {str(e)}")
-                continue
-        
-        logger.info(f"Query returned {len(matched_objects)} matches")
-        
-        # 转换为响应模型
-        return [
-            JSONObjectResponse(
-                id=obj.id,
-                name=obj.name,
-                content_type=obj.content_type,
-                size=obj.size,
-                created_at=str(obj.created_at),
-                type=obj.type,
-                content=content
-            ) for obj, content in matched_objects
-        ]
-    
-    except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error during JSON query: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+# JSON 查询模型
+class JSONQueryModel(BaseModel):
+    jsonpath: str
+    value: Optional[Any] = None
+    operator: Optional[str] = 'eq'
+    type: Optional[str] = None
 
 def validate_jsonpath(path: str) -> bool:
     """验证 JSONPath 表达式的基本格式"""
     if not path:
         return False
-    # 检查基本格式
     if not path.startswith('$'):
         return False
-    # 允许 JSONPath 过滤表达式中的特殊字符
-    # 例如: $.data[?(@.type=="idea")] 是合法的
     return True
 
-def _apply_filter(value, compare_value, operator):
-    """
-    根据指定运算符比较值
-    """
+# JSON对象查询接口
+@router.post("/query/json", response_model=List[JSONObjectResponse])
+async def query_json_objects(
+    query: JSONQueryModel,
+    db: Session = Depends(get_db),
+    limit: Optional[int] = 100,
+    offset: Optional[int] = 0
+):
+    """根据 JSONPath 查询和过滤 JSON 对象"""
+    request_id = str(uuid.uuid4())
+    logger.debug(f"[{request_id}] Starting query with path: {query.jsonpath}")
+    
     try:
-        if operator == 'eq':
-            return value == compare_value
-        elif operator == 'gt':
-            return value > compare_value
-        elif operator == 'lt':
-            return value < compare_value
-        elif operator == 'ge':
-            return value >= compare_value
-        elif operator == 'le':
-            return value <= compare_value
-        elif operator == 'contains':
-            if isinstance(value, (list, str, dict)):
-                return compare_value in value
-            return False
-        else:
-            raise ValueError(f"不支持的运算符: {operator}")
-    except TypeError:
-        return False
+        # 验证 JSONPath
+        if not validate_jsonpath(query.jsonpath):
+            logger.warning(f"[{request_id}] Invalid JSONPath: {query.jsonpath}")
+            raise HTTPException(status_code=422, detail="Invalid JSONPath")
+            
+        # 基础查询
+        base_query = db.query(ObjectStorage).filter(
+            ObjectStorage.content_type == "application/json"
+        )
+        
+        # 添加类型过滤
+        if query.type:
+            base_query = base_query.filter(ObjectStorage.type == query.type)
+            
+        # 执行查询
+        try:
+            objects = base_query.offset(offset).limit(limit).all()
+            logger.debug(f"[{request_id}] Found {len(objects)} objects")
+        except Exception as e:
+            logger.error(f"[{request_id}] Database error: {str(e)}")
+            raise HTTPException(status_code=500, detail="Database error")
+            
+        # 处理结果
+        results = []
+        for obj in objects:
+            try:
+                content = json.loads(obj.content)
+                # 使用 jsonpath 过滤
+                matches = jsonpath.jsonpath(content, query.jsonpath)
+                if matches:
+                    results.append(JSONObjectResponse(
+                        id=obj.id,
+                        name=obj.name,
+                        content_type=obj.content_type,
+                        size=obj.size,
+                        created_at=str(obj.created_at),
+                        type=obj.type,
+                        content=content
+                    ))
+            except json.JSONDecodeError:
+                logger.warning(f"[{request_id}] Invalid JSON in object {obj.id}")
+                continue
+            except Exception as e:
+                logger.error(f"[{request_id}] Error processing object {obj.id}: {str(e)}")
+                continue
+                
+        logger.info(f"[{request_id}] Query returned {len(results)} matches")
+        return results
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # 注册路由
 app.include_router(router)
 
-# 启动服务器配置
+# 启动配置
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
         workers=1,  # 开发模式使用单进程
-        log_level="info"
+        log_level="debug",
+        timeout_keep_alive=30,
+        loop="asyncio",
+        reload=True  # 开发模式启用热重载
     )

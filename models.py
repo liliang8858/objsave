@@ -1,8 +1,8 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Float, Text
 from sqlalchemy.orm import relationship
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from database import Base
 
@@ -13,9 +13,11 @@ class ObjectStorage(Base):
     id = Column(String, primary_key=True)
     name = Column(String)
     content_type = Column(String)
+    content = Column(Text)  # 使用Text类型存储JSON内容
+    type = Column(String)   # 添加type字段
     size = Column(Integer)
     created_at = Column(DateTime, default=datetime.utcnow)
-    owner = Column(String)
+    owner = Column(String, nullable=True)
     
 class ObjectMetadata(BaseModel):
     """对象元数据模型"""
@@ -24,8 +26,17 @@ class ObjectMetadata(BaseModel):
     content_type: str
     size: int
     created_at: str
-    owner: str
+    type: Optional[str] = None
+    owner: Optional[str] = None
     
+class JSONObjectModel(BaseModel):
+    """JSON对象模型"""
+    id: Optional[str] = None
+    name: Optional[str] = None
+    content: Dict[str, Any]
+    type: Optional[str] = None
+    content_type: str = "application/json"
+
 class User(Base):
     """用户模型"""
     __tablename__ = "users"
