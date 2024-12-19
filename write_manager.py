@@ -133,15 +133,19 @@ class WriteManager:
             return self.cache.get(record_id)
             
     async def _write_to_wal(self, record: Dict[str, Any]):
-        """使用异步I/O写入WAL文件"""
+        """使用异步I/O写入WAL文件，批量写入以提高性能"""
         wal_entry = {
             'timestamp': time.time(),
             'record': record
         }
         
-        # 使用记录ID和时间戳生成WAL文件名
+        # 使用记录ID的前两个字符作为子目录，减少单个目录下的文件数量
+        id_prefix = record['id'][:2]
+        wal_subdir = os.path.join(self.wal_dir, id_prefix)
+        os.makedirs(wal_subdir, exist_ok=True)
+        
         filename = f"{record['id']}_{int(time.time()*1000)}.wal"
-        filepath = os.path.join(self.wal_dir, filename)
+        filepath = os.path.join(wal_subdir, filename)
         
         # 使用异步I/O写入
         success = await self.async_io.write_json(filepath, wal_entry)
@@ -184,6 +188,8 @@ class WriteManager:
             
     async def _flush_to_db(self, force: bool = False):
         """刷新数据到数据库"""
+        records_to_process = []
+        
         async with self._queue_lock:
             if not force and len(self.write_queue) < self.batch_size:
                 return
@@ -192,25 +198,54 @@ class WriteManager:
                 return
                 
             # 获取待写入记录
-            records = []
-            seen_ids = set()  # 用于去重
-            
-            while self.write_queue and (force or len(records) < self.batch_size):
+            seen_ids = set()
+            while self.write_queue and (force or len(records_to_process) < self.batch_size):
                 record = self.write_queue.popleft()
-                # 检查ID是否重复
                 if record['id'] not in seen_ids:
-                    records.append(record)
+                    records_to_process.append(record)
                     seen_ids.add(record['id'])
-                else:
-                    logger.warning(f"Duplicate record ID found: {record['id']}, skipping")
                     
-        if not records:
+        if not records_to_process:
             return
             
         start_time = time.time()
+        
+        # 使用线程池执行数据库操作
+        loop = asyncio.get_event_loop()
+        try:
+            # 在线程池中执行数据库操作
+            await loop.run_in_executor(
+                None, 
+                self._execute_db_operation, 
+                records_to_process
+            )
+            
+            write_time = time.time() - start_time
+            self.metrics.record_flush(
+                size=len(records_to_process),
+                latency=write_time * 1000,
+                success=True
+            )
+            
+        except Exception as e:
+            logger.error(f"Database write error: {str(e)}")
+            # 将失败的记录放回队列
+            async with self._queue_lock:
+                for record in reversed(records_to_process):
+                    self.write_queue.appendleft(record)
+                    
+            self.metrics.record_flush(
+                size=len(records_to_process),
+                latency=(time.time() - start_time) * 1000,
+                success=False
+            )
+            raise
+
+    def _execute_db_operation(self, records):
+        """在线程池中执行数据库操作"""
         db = SessionLocal()
         try:
-            # 首先检查数据库中已存在的ID
+            # 检查已存在的ID
             existing_ids = set(
                 row[0] for row in 
                 db.query(ObjectStorage.id).filter(
@@ -225,13 +260,11 @@ class WriteManager:
             ]
             
             if not new_records:
-                logger.info("All records already exist in database")
                 return
                 
             # 批量插入新记录
             db_objects = []
             for record in new_records:
-                # 确保created_at是datetime对象
                 if isinstance(record.get('created_at'), str):
                     created_at = datetime.fromisoformat(record['created_at'])
                 else:
@@ -248,50 +281,29 @@ class WriteManager:
                 )
                 db_objects.append(obj)
                 
-            try:
-                db.bulk_save_objects(db_objects)
-                db.commit()
-                
-                # 更新统计信息
-                write_time = time.time() - start_time
-                self.metrics.record_flush(
-                    size=len(new_records),
-                    latency=write_time * 1000,  # 转换为毫秒
-                    success=True
-                )
-                
-                logger.info(f"Successfully wrote {len(new_records)} records to database in {write_time:.2f}s")
-                
-            except Exception as e:
-                db.rollback()
-                logger.error(f"Database write error: {str(e)}")
-                
-                # 将失败的记录放回队列
-                async with self._queue_lock:
-                    for record in reversed(new_records):
-                        if record['id'] not in existing_ids:  # 只放回不存在的记录
-                            self.write_queue.appendleft(record)
-                            
-                self.metrics.record_flush(
-                    size=len(new_records),
-                    latency=(time.time() - start_time) * 1000,
-                    success=False
-                )
-                raise
-                
+            db.bulk_save_objects(db_objects)
+            db.commit()
+            
         finally:
             db.close()
-            
+
     async def _flush_loop(self):
         """后台刷新循环"""
         while self._running:
             try:
-                await self._flush_to_db()
-                await asyncio.sleep(self.flush_interval)
+                # 检查队列大小，只在有数据时才进行刷新
+                if len(self.write_queue) >= self.batch_size:
+                    await self._flush_to_db()
+                elif len(self.write_queue) > 0:
+                    # 如果有数据但未达到批次大小，等待更长时间
+                    await asyncio.sleep(self.flush_interval * 2)
+                else:
+                    # 队列为空时，降低检查频率
+                    await asyncio.sleep(self.flush_interval * 5)
             except Exception as e:
                 logger.error(f"Flush loop error: {str(e)}")
-                await asyncio.sleep(1)  # 错误后短暂等待
-                
+                await asyncio.sleep(1)
+
     def get_stats(self) -> Dict[str, Any]:
         """获取写入统计信息"""
         return {
