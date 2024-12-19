@@ -1,145 +1,141 @@
-# ObjSave - 高性能对象存储服务
+# ObjSave - High-Performance Object Storage Service
 
-ObjSave 是一个基于 FastAPI 的高性能对象存储服务，提供对象的存储、检索、更新和查询功能。
+ObjSave is a high-performance object storage service built on FastAPI, providing robust capabilities for object storage, retrieval, updates, and querying. It is designed for high performance, reliability, and ease of use.
 
-## 功能特性
+English | [简体中文](README_zh.md)
 
-- 对象存储：支持任意类型对象的存储和检索
-- JSON 查询：支持基于 JSONPath 的复杂查询
-- 高性能：异步处理，内存缓存
-- 监控指标：全面的系统监控和性能指标
-- 健康检查：实时系统状态监控和告警
-- 安全性：支持访问控制和数据加密
+## Features
 
-## 版本信息
+- **High Performance** - Asynchronous processing, memory caching, support for massive concurrency
+- **Object Storage** - Store and retrieve objects of any type
+- **Smart Querying** - Complex queries supported via JSONPath
+- **Monitoring** - Comprehensive system monitoring and performance metrics
+- **Security** - Access control and data encryption
+- **Real-time Monitoring** - Real-time system status monitoring and alerts
 
-- 版本号：1.0.0
-- 发布日期：2024-12-19
-- Python 版本要求：>=3.8
+## Version Information
 
+- Version: 1.0.0
+- Release Date: 2024-12-19
+- Python Version Required: >=3.8
 
-## 快速开始
+## Quick Start
 
-### 创建虚拟环境
+### Environment Setup
+
+```bash
+# Create virtual environment
 python -m venv objectstorage_env
 
-### 激活虚拟环境
+# Activate virtual environment
+# Windows
 objectstorage_env\Scripts\activate
+# Linux/Mac
+source objectstorage_env/bin/activate
 
-
-1. 安装依赖：
-```bash
+# Install dependencies
 pip install -r requirements.txt
 ```
 
+### Start Service
 
-2. 启动服务：
 ```bash
 python app.py
 ```
 
-3. 访问服务：
-- API 文档：http://localhost:8000/docs
-- 健康检查：http://localhost:8000/objsave/health
-- 指标监控：http://localhost:8000/objsave/metrics
+### Access Service
 
-## API 接口
+- API Documentation: http://localhost:8000/docs
+- Health Check: http://localhost:8000/objsave/health
+- Metrics: http://localhost:8000/objsave/metrics
 
-### 对象操作
-- POST /objsave/objects - 存储对象
-- GET /objsave/objects/{id} - 获取对象
-- PUT /objsave/objects/{id} - 更新对象
-- DELETE /objsave/objects/{id} - 删除对象
+## API Endpoints
 
-### 查询接口
-- POST /objsave/query/json - JSON对象查询
-- GET /objsave/query/metadata - 元数据查询
+### Object Operations
+- `POST /objsave/objects` - Store object
+- `GET /objsave/objects/{id}` - Retrieve object
+- `PUT /objsave/objects/{id}` - Update object
+- `DELETE /objsave/objects/{id}` - Delete object
 
-### 监控接口
-- GET /objsave/health - 系统健康状态
-- GET /objsave/metrics - 性能指标
+### Query Interfaces
+- `POST /objsave/query/json` - JSON object query
+- `GET /objsave/query/metadata` - Metadata query
 
-## 监控指标
+### Monitoring Interfaces
+- `GET /objsave/health` - System health status
+- `GET /objsave/metrics` - Performance metrics
 
-### 系统指标
-- CPU使用率
-- 内存使用情况
-- 磁盘使用情况
-- 进程状态
+## Monitoring Metrics
 
-### 存储指标
-- 操作计数和延迟
-- 缓存命中率
-- 错误率统计
-- 数据大小统计
+### System Metrics
+- CPU Usage
+- Memory Usage
+- Disk Usage
+- Process Status
 
-### HTTP指标
-- 请求率和错误率
-- 延迟分布
-- 状态码统计
-- 响应大小统计
+### Storage Metrics
+- Operation Count and Latency
+- Cache Hit Rate
+- Error Rate Statistics
+- Data Size Statistics
 
-### 队列和工作流
-- 队列使用情况
-- 工作流成功率
-- 处理延迟统计
+### HTTP Metrics
+- Request Rate and Error Rate
+- Latency Distribution
+- Status Code Statistics
+- Response Size Statistics
 
-## 配置说明
+## Configuration
 
-主要配置项：
-- PORT: 服务端口号（默认：8000）
-- HOST: 服务地址（默认：0.0.0.0）
-- STORAGE_PATH: 存储路径
-- MAX_OBJECT_SIZE: 最大对象大小
-- CACHE_SIZE: 缓存大小
+Key Configuration Items:
+- `PORT`: Service port (default: 8000)
+- `HOST`: Service address (default: 0.0.0.0)
+- `STORAGE_PATH`: Storage path
+- `MAX_OBJECT_SIZE`: Maximum object size
+- `CACHE_SIZE`: Cache size
 
-## 性能优化
+## Performance Optimization
 
-1. 异步处理：
-   - 使用异步IO
-   - 后台任务处理
-   - 批量操作优化
+1. Asynchronous Processing:
+   - Async IO
+   - Background Task Processing
+   - Batch Operation Optimization
 
-2. 缓存策略：
-   - 内存缓存
-   - 热点数据优化
-   - 缓存预热
+2. Caching Strategy:
+   - Memory Cache
+   - Hot Data Optimization
+   - Cache Preheating
 
-3. 存储优化：
-   - 数据压缩
-   - 批量写入
-   - 延迟写入
+3. Storage Optimization:
+   - Data Compression
+   - Batch Writing
+   - Delayed Writing
 
-## 监控告警
+## Monitoring Alerts
 
-支持多级告警：
-- Critical: 严重问题，需要立即处理
-- Warning: 潜在问题，需要关注
-- Info: 提示信息
+Supports multi-level alerts:
+- Critical: Severe issues requiring immediate attention
+- Warning: Potential issues requiring attention
+- Info: Informational notifications
 
-告警指标：
-- 系统资源使用率
-- 错误率
-- 响应时间
-- 队列积压
-- 存储容量
+## Development Roadmap
 
-## 开发计划
+1. Short-term Plans:
+   - Distributed Storage Support
+   - Data Compression Optimization
+   - Additional Query Features
 
-1. 短期计划：
-   - 分布式存储支持
-   - 数据压缩优化
-   - 更多查询功能
+2. Long-term Plans:
+   - Cluster Support
+   - Data Backup and Recovery
+   - More Storage Backends
 
-2. 长期计划：
-   - 集群支持
-   - 数据备份恢复
-   - 更多存储后端
+## Contributing
 
-## 贡献指南
+We welcome all forms of contributions, whether it's new features, documentation improvements, or bug reports!
 
-欢迎提交 Issue 和 Pull Request！
+## License
 
-## 许可证
+This project is licensed under the MIT License. For commercial use, please contact: sblig3@gmail.com
 
-MIT License
+See the [LICENSE](LICENSE) file for details.
