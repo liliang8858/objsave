@@ -10,10 +10,10 @@ from database import SessionLocal
 import threading
 import time
 import os
-import aiofiles
 import hashlib
 from zero_copy import ZeroCopyWriter
 from monitor import MetricsCollector
+from async_io import AsyncIOManager
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,9 @@ class WriteManager:
         # 性能监控器
         self.metrics = MetricsCollector()
         
+        # 异步I/O管理器
+        self.async_io = AsyncIOManager()
+        
         # 控制标志
         self._running = False
         self._flush_event = asyncio.Event()
@@ -58,8 +61,9 @@ class WriteManager:
             return
             
         self._running = True
-        # 启动监控
+        # 启动监控和I/O管理器
         await self.metrics.start()
+        await self.async_io.start()
         # 恢复WAL
         await self._recover_from_wal()
         # 启动后台刷新任务
@@ -75,6 +79,7 @@ class WriteManager:
         self._flush_event.set()
         await self._flush_to_db(force=True)  # 强制刷新所有数据
         await self.metrics.stop()  # 停止监控
+        await self.async_io.stop()  # 停止I/O管理器
         self.zero_copy.cleanup()
         
         # 保存监控数据
@@ -128,7 +133,7 @@ class WriteManager:
             return self.cache.get(record_id)
             
     async def _write_to_wal(self, record: Dict[str, Any]):
-        """使用零拷贝写入WAL文件"""
+        """使用异步I/O写入WAL文件"""
         wal_entry = {
             'timestamp': time.time(),
             'record': record
@@ -138,16 +143,10 @@ class WriteManager:
         filename = f"{record['id']}_{int(time.time()*1000)}.wal"
         filepath = os.path.join(self.wal_dir, filename)
         
-        try:
-            # 将数据序列化为字节
-            data = json.dumps(wal_entry).encode('utf-8')
-            
-            # 使用零拷贝写入
-            await self.zero_copy.write_file(filepath, data)
-            
-        except Exception as e:
-            logger.error(f"Failed to write WAL: {str(e)}")
-            raise
+        # 使用异步I/O写入
+        success = await self.async_io.write_json(filepath, wal_entry)
+        if not success:
+            raise Exception("Failed to write WAL file")
             
     async def _recover_from_wal(self):
         """从WAL恢复数据"""
@@ -161,11 +160,15 @@ class WriteManager:
                 try:
                     # 使用零拷贝读取
                     with open(filepath, 'rb') as f:
-                        content = f.read()  # 文件已经在内存映射中
+                        content = f.read()
                     wal_entry = json.loads(content.decode('utf-8'))
                     record = wal_entry['record']
-                    self.write_queue.append(record)
-                    self.cache[record['id']] = record
+                    
+                    # 检查记录是否已存在
+                    async with self._cache_lock:
+                        if record['id'] not in self.cache:
+                            self.write_queue.append(record)
+                            self.cache[record['id']] = record
                     
                 except Exception as e:
                     logger.error(f"Failed to recover WAL {filename}: {str(e)}")
