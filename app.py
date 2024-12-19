@@ -98,6 +98,9 @@ app = FastAPI(
     openapi_url="/objsave/openapi.json"
 )
 
+# 请求信号量，限制并发请求数
+request_semaphore = asyncio.Semaphore(MAX_WORKERS)
+
 # 请求ID中间件
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
@@ -106,9 +109,10 @@ async def request_id_middleware(request: Request, call_next):
     logger.info(f"[{request_id}] Request started: {request.method} {request.url.path}")
     
     try:
-        response = await call_next(request)
-        logger.info(f"[{request_id}] Request completed")
-        return response
+        async with request_semaphore:
+            response = await call_next(request)
+            logger.info(f"[{request_id}] Request completed")
+            return response
     except Exception as e:
         logger.error(f"[{request_id}] Request failed: {str(e)}")
         raise
@@ -395,53 +399,56 @@ async def upload_json_object(
         if content_size > 10 * 1024 * 1024:
             logger.warning(f"[{request_id}] Content too large")
             raise HTTPException(status_code=413, detail="Content too large")
-        
+            
         # 准备数据
         object_id = str(uuid.uuid4())
-        current_time = datetime.now()  # 使用datetime对象而不是字符串
+        current_time = datetime.now()
         
-        # 同步数据库操作
-        logger.debug(f"[{request_id}] Starting database operation")
+        # 使用超时保护的数据库操作
         try:
-            obj = ObjectStorage(
-                id=object_id,
-                name=json_data.name or object_id,
-                content=content_str,
-                content_type='application/json',
-                type=json_data.type,
-                size=content_size,
-                created_at=current_time,  # 使用datetime对象
-                owner=None
-            )
-            db.add(obj)
-            db.commit()
-            logger.debug(f"[{request_id}] Database commit successful")
-            db.refresh(obj)
+            async with asyncio.timeout(5):  # 5秒超时
+                obj = ObjectStorage(
+                    id=object_id,
+                    name=json_data.name or object_id,
+                    content=content_str,
+                    content_type='application/json',
+                    type=json_data.type,
+                    size=content_size,
+                    created_at=current_time,
+                    owner=None
+                )
+                db.add(obj)
+                await asyncio.to_thread(db.commit)
+                db.refresh(obj)
+                logger.debug(f"[{request_id}] Database operation completed")
+                
+        except asyncio.TimeoutError:
+            logger.error(f"[{request_id}] Database operation timed out")
+            db.rollback()
+            raise HTTPException(status_code=408, detail="Database timeout")
         except Exception as e:
             logger.error(f"[{request_id}] Database error: {str(e)}")
             db.rollback()
             raise HTTPException(status_code=500, detail="Database error")
-        
+            
         # 准备响应
         metadata = ObjectMetadata(
             id=obj.id,
             name=obj.name,
             content_type=obj.content_type,
             size=obj.size,
-            created_at=obj.created_at.isoformat(),  # 转换为ISO格式字符串
+            created_at=obj.created_at.isoformat(),
             type=obj.type
         )
         
         # 异步缓存操作
         try:
             logger.debug(f"[{request_id}] Starting cache operation")
-            await asyncio.wait_for(
-                asyncio.gather(
+            async with asyncio.timeout(2):  # 2秒缓存超时
+                await asyncio.gather(
                     asyncio.to_thread(lambda: cache.set(f"metadata:{object_id}", metadata.dict())),
                     asyncio.to_thread(lambda: cache.set(f"content:{object_id}", json_data.content))
-                ),
-                timeout=5
-            )
+                )
             logger.debug(f"[{request_id}] Cache operation completed")
         except asyncio.TimeoutError:
             logger.warning(f"[{request_id}] Cache operation timed out")
@@ -451,8 +458,7 @@ async def upload_json_object(
         logger.info(f"[{request_id}] Upload completed successfully")
         return metadata
         
-    except HTTPException as he:
-        logger.error(f"[{request_id}] HTTP error: {str(he)}")
+    except HTTPException:
         raise
     except Exception as e:
         logger.error(f"[{request_id}] Unexpected error: {str(e)}")
@@ -496,7 +502,7 @@ async def upload_json_objects_batch(
         logger.debug(f"[{request_id}] Starting database transaction")
         try:
             db.add_all(db_objects)
-            db.commit()
+            await asyncio.to_thread(db.commit)
             logger.debug(f"[{request_id}] Database transaction successful")
             
             # 创建元数据列表
@@ -560,7 +566,7 @@ async def update_json_object(
             db_object.size = content_size
             db_object.type = json_data.type
             
-            db.commit()
+            await asyncio.to_thread(db.commit)
             db.refresh(db_object)
             logger.debug(f"[{request_id}] Database update successful")
             
