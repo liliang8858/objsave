@@ -6,6 +6,8 @@ import logging
 from datetime import datetime
 from queue import Queue
 import threading
+from obsave.core.database import SessionLocal, Base
+from obsave.core.models import ObjectStorage
 
 logger = logging.getLogger(__name__)
 
@@ -178,10 +180,39 @@ class WriteManager:
     def _flush_buffer(self):
         """刷新缓冲区"""
         try:
-            # 这里应该实现具体的写入逻辑
-            # 为了示例，我们只是清空缓冲区
-            self.buffer.clear()
+            if not self.buffer:
+                return
             
+            # 创建数据库会话
+            db = SessionLocal()
+            try:
+                for record in self.buffer:
+                    # 创建数据库对象
+                    db_object = ObjectStorage(
+                        id=record['id'],
+                        name=record['name'],
+                        content=record['content'],
+                        content_type=record['content_type'],
+                        type=record['type'],
+                        size=record['size'],
+                        created_at=datetime.fromisoformat(record['created_at']),
+                        owner=record.get('owner')
+                    )
+                    db.add(db_object)
+                
+                # 提交所有更改
+                db.commit()
+                logger.debug(f"Successfully flushed {len(self.buffer)} records to database")
+                
+            except Exception as e:
+                logger.error(f"Database error during flush: {str(e)}")
+                db.rollback()
+                raise
+            finally:
+                db.close()
+                
+            # 清空缓冲区
+            self.buffer.clear()
             self.stats['total_flushes'] += 1
             self.stats['buffer_size'] = len(self.buffer)
             
