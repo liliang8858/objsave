@@ -28,22 +28,23 @@ from obsave.utils import CacheManager, RequestQueue, WriteManager, AsyncIOManage
 from obsave.core.models import ObjectMetadata, JSONObjectModel, ObjectStorage as ObjectStorageModel
 
 # 配置日志记录
-os.makedirs(LOG_DIR, exist_ok=True)
+logger = logging.getLogger("obsave")
+logger.setLevel(getattr(logging, LOG_LEVEL))
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format=LOG_FORMAT,
-    handlers=[
-        logging.StreamHandler(),
-        RotatingFileHandler(
-            LOG_FILE,
-            maxBytes=LOG_MAX_BYTES,
-            backupCount=LOG_BACKUP_COUNT,
-            encoding='utf-8'
-        )
-    ]
+# 创建日志处理器
+file_handler = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=LOG_MAX_BYTES,
+    backupCount=LOG_BACKUP_COUNT
 )
-logger = logging.getLogger(__name__)
+file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+logger.addHandler(file_handler)
+
+# 如果不是生产环境，也添加控制台输出
+if LOG_LEVEL == "DEBUG":
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logger.addHandler(console_handler)
 
 # 系统配置
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
@@ -72,21 +73,27 @@ storage = ObjectStorage(
 
 # 创建缓存管理器实例
 cache = CacheManager(
-    max_items=CACHE_MAX_ITEMS,
-    shards=CACHE_SHARDS,
+    max_items=CACHE_MAX_SIZE,
+    shards=32,
     ttl=CACHE_TTL
 )
 
 # 创建请求队列实例
 request_queue = RequestQueue(
-    max_workers=MAX_WORKERS
+    max_workers=MAX_WORKERS,
+    max_queue_size=10000
 )
 
 # 全局写入管理器
 write_manager = WriteManager(
-    batch_size=WRITE_BATCH_SIZE,
-    flush_interval=WRITE_FLUSH_INTERVAL,
-    max_queue_size=WRITE_MAX_QUEUE_SIZE
+    batch_size=100,
+    flush_interval=1.0,
+    max_queue_size=10000
+)
+
+# 创建异步IO管理器实例
+io_manager = AsyncIOManager(
+    max_workers=MAX_WORKERS
 )
 
 @asynccontextmanager
@@ -94,7 +101,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up server...")
     logger.info(f"Available workers: {MAX_WORKERS}")
-    logger.info(f"Cache config: max_items={CACHE_MAX_ITEMS}, shards={CACHE_SHARDS}, ttl={CACHE_TTL}s")
+    logger.info(f"Cache config: max_items={CACHE_MAX_SIZE}, shards=32, ttl={CACHE_TTL}s")
     
     # 初始化数据库
     init_db()
@@ -257,6 +264,8 @@ class JSONObjectModel(BaseModel):
     content: Dict[str, Any]
     name: Optional[str] = None
     content_type: str = "application/json"
+
+    model_config = ConfigDict(from_attributes=True)
 
 # JSON对象响应模型
 class JSONObjectResponse(BaseModel):
