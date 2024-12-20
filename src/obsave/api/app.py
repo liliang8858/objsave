@@ -16,6 +16,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 from contextlib import asynccontextmanager
+from jsonpath_ng import parse as parse_jsonpath
 
 from obsave.core.storage import ObjectStorage
 from obsave.core.exceptions import StorageError, ObjectNotFoundError, ObjSaveException
@@ -283,9 +284,12 @@ def validate_jsonpath(path: str) -> bool:
     """验证 JSONPath 表达式的基本格式"""
     if not path:
         return False
-    if not path.startswith('$'):
+    try:
+        parse_jsonpath(path)
+        return True
+    except Exception as e:
+        logger.warning(f"Invalid JSONPath: {path}, error: {str(e)}")
         return False
-    return True
 
 # 健康检查接口
 @router.get("/health",
@@ -1034,6 +1038,9 @@ async def query_json_objects(
             logger.warning(f"[{request_id}] Invalid JSONPath: {query.jsonpath}")
             raise HTTPException(status_code=422, detail="Invalid JSONPath")
             
+        # 编译 JSONPath 表达式
+        jsonpath_expr = parse_jsonpath(query.jsonpath)
+            
         # 基础查询
         base_query = db.query(ObjectStorageModel).filter(
             ObjectStorageModel.content_type == "application/json"
@@ -1057,8 +1064,23 @@ async def query_json_objects(
             try:
                 content = json.loads(obj.content)
                 # 使用 jsonpath 过滤
-                matches = jsonpath.jsonpath(content, query.jsonpath)
+                matches = [match.value for match in jsonpath_expr.find(content)]
                 if matches:
+                    # 如果指定了值和操作符，进行进一步过滤
+                    if query.value is not None:
+                        if query.operator == 'eq' and not any(x == query.value for x in matches):
+                            continue
+                        elif query.operator == 'ne' and not any(x != query.value for x in matches):
+                            continue
+                        elif query.operator == 'gt' and not any(x > query.value for x in matches):
+                            continue
+                        elif query.operator == 'lt' and not any(x < query.value for x in matches):
+                            continue
+                        elif query.operator == 'gte' and not any(x >= query.value for x in matches):
+                            continue
+                        elif query.operator == 'lte' and not any(x <= query.value for x in matches):
+                            continue
+                            
                     results.append(JSONObjectResponse(
                         id=obj.id,
                         name=obj.name,
