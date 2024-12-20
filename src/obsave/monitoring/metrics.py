@@ -1,5 +1,14 @@
-"""Prometheus metrics collection for ObSave."""
-
+import os
+import uuid
+from typing import Dict, Any
+from threading import Lock
+import logging
+import threading
+import gc
+from datetime import datetime
+import time
+import psutil
+import platform
 from prometheus_client import (
     Counter,
     Gauge,
@@ -8,11 +17,7 @@ from prometheus_client import (
     generate_latest,
     CONTENT_TYPE_LATEST,
 )
-import time
-import psutil
-from typing import Dict, Any
-from threading import Lock
-import logging
+from fastapi import Response
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +54,8 @@ STORAGE_SIZE = Gauge(
 )
 
 STORAGE_FILES = Gauge(
-    'obsave_storage_files_total',
-    'Total number of stored files',
+    'obsave_storage_files',
+    'Number of files in storage',
     registry=REGISTRY
 )
 
@@ -94,26 +99,135 @@ class MetricsCollector:
         self._lock = Lock()
         self._process = psutil.Process()
         self._start_time = time.time()
+        self._system = platform.system().lower()
         
+    def _safe_call(self, func, default=None, *args, **kwargs):
+        """安全调用函数，如果失败返回默认值"""
+        try:
+            return func(*args, **kwargs)
+        except (psutil.Error, OSError, AttributeError):
+            return default
+            
     def collect_system_metrics(self):
         """收集系统指标"""
+        metrics = {}
         try:
-            # 内存使用
-            memory_info = self._process.memory_info()
-            MEMORY_USAGE.labels('rss').set(memory_info.rss)
-            MEMORY_USAGE.labels('vms').set(memory_info.vms)
+            # CPU 指标
+            cpu_times = self._safe_call(self._process.cpu_times)
+            cpu_metrics = {
+                'cpu_usage_percent': self._safe_call(self._process.cpu_percent),
+                'cpu_count_physical': self._safe_call(lambda: psutil.cpu_count(logical=False), 0),
+                'cpu_count_logical': self._safe_call(psutil.cpu_count, 0),
+                'process_cpu_percent': self._safe_call(self._process.cpu_percent),
+                'process_cpu_times': cpu_times._asdict() if cpu_times else {}
+            }
+            CPU_USAGE.set(cpu_metrics['cpu_usage_percent'] or 0.0)
+            metrics['cpu'] = cpu_metrics
+
+            # 内存指标
+            memory = self._safe_call(psutil.virtual_memory)
+            process_memory = self._safe_call(self._process.memory_info)
+            memory_metrics = {
+                'memory_usage_percent': getattr(memory, 'percent', 0.0),
+                'memory_available_gb': getattr(memory, 'available', 0) / (1024 ** 3),
+                'memory_total_gb': getattr(memory, 'total', 0) / (1024 ** 3),
+            }
             
-            # CPU 使用
-            CPU_USAGE.set(self._process.cpu_percent())
+            if process_memory:
+                memory_metrics.update({
+                    'process_memory_rss_mb': getattr(process_memory, 'rss', 0) / (1024 ** 2),
+                    'process_memory_vms_mb': getattr(process_memory, 'vms', 0) / (1024 ** 2)
+                })
+                MEMORY_USAGE.labels('rss').set(getattr(process_memory, 'rss', 0))
+                MEMORY_USAGE.labels('vms').set(getattr(process_memory, 'vms', 0))
+                
+            metrics['memory'] = memory_metrics
+
+            # 磁盘指标
+            disk = self._safe_call(lambda: psutil.disk_usage('/'))
+            disk_metrics = {
+                'disk_usage_percent': getattr(disk, 'percent', 0.0),
+                'disk_free_gb': getattr(disk, 'free', 0) / (1024 ** 3),
+                'disk_total_gb': getattr(disk, 'total', 0) / (1024 ** 3)
+            }
+            metrics['disk'] = disk_metrics
+
+            # 进程指标
+            process_metrics = {
+                'process_threads_count': len(self._safe_call(self._process.threads, [])),
+                'process_open_files': len(self._safe_call(self._process.open_files, [])),
+                'process_connections': len(self._safe_call(self._process.connections, [])),
+                'process_children': len(self._safe_call(self._process.children, []))
+            }
             
-            # 打开的文件数
-            OPEN_FILES.set(len(self._process.open_files()))
+            # Windows 特有的句柄数
+            if self._system == 'windows':
+                process_metrics['process_handles'] = self._safe_call(self._process.num_handles)
+                
+            THREAD_COUNT.set(process_metrics['process_threads_count'])
+            OPEN_FILES.set(process_metrics['process_open_files'])
+            metrics['process'] = process_metrics
+
+            # IO 指标
+            io_counters = self._safe_call(self._process.io_counters)
+            io_metrics = {}
+            if io_counters:
+                io_metrics = {
+                    'process_io_read_mb': getattr(io_counters, 'read_bytes', 0) / (1024 ** 2),
+                    'process_io_write_mb': getattr(io_counters, 'write_bytes', 0) / (1024 ** 2),
+                    'process_io_read_count': getattr(io_counters, 'read_count', 0),
+                    'process_io_write_count': getattr(io_counters, 'write_count', 0)
+                }
+            metrics['io'] = io_metrics
+
+            # 运行时指标
+            runtime_metrics = {
+                'python_gc_counts': gc.get_count(),
+                'python_threads_active': threading.active_count(),
+                'uptime_seconds': time.time() - self._start_time
+            }
+            metrics['runtime'] = runtime_metrics
+
+            # 网络连接指标
+            connections = self._safe_call(self._process.connections, [])
+            net_metrics = {
+                'connections': {
+                    'total': len(connections),
+                    'established': len([c for c in connections if getattr(c, 'status', '') == 'ESTABLISHED']),
+                    'listen': len([c for c in connections if getattr(c, 'status', '') == 'LISTEN']),
+                    'time_wait': len([c for c in connections if getattr(c, 'status', '') == 'TIME_WAIT'])
+                }
+            }
+            metrics['network'] = net_metrics
+
+            # 文件系统指标
+            fs_metrics = {
+                'open_files': len(self._safe_call(self._process.open_files, [])),
+            }
             
-            # 线程数
-            THREAD_COUNT.set(len(self._process.threads()))
+            # Windows 特有的句柄计数
+            if self._system == 'windows':
+                fs_metrics['handles'] = self._safe_call(self._process.num_handles)
             
+            metrics['filesystem'] = fs_metrics
+
+            # 基本系统信息
+            metrics['system'] = {
+                'platform': platform.system(),
+                'platform_release': platform.release(),
+                'python_version': platform.python_version(),
+                'hostname': platform.node()
+            }
+
+            return metrics
+
         except Exception as e:
-            logger.error(f"Error collecting system metrics: {str(e)}")
+            logger.error(f"Error collecting system metrics: {str(e)}", exc_info=True)
+            return {
+                'error': str(e),
+                'status': 'error',
+                'timestamp': datetime.utcnow().isoformat()
+            }
             
     def update_storage_metrics(self, stats: Dict[str, Any]):
         """更新存储指标"""
@@ -148,8 +262,14 @@ metrics_collector = MetricsCollector()
 
 async def metrics_endpoint():
     """Prometheus 指标端点处理函数"""
-    # 收集最新的系统指标
-    metrics_collector.collect_system_metrics()
-    
-    # 生成指标数据
-    return generate_latest(REGISTRY), CONTENT_TYPE_LATEST
+    try:
+        return Response(
+            generate_latest(REGISTRY),
+            media_type=CONTENT_TYPE_LATEST
+        )
+    except Exception as e:
+        logger.error(f"Error generating metrics: {str(e)}")
+        return Response(
+            content="Error generating metrics",
+            status_code=500
+        )
