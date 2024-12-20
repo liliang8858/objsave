@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # 缓存设置
     CACHE_TTL: int = 300  # 5分钟
     CACHE_MAX_SIZE: int = 1000  # 最多缓存1000个对象
+    CACHE_SHARDS: int = 32  # 缓存分片数
     
     # 安全设置
     SECRET_KEY: str = "your-secret-key-here"  # 请在生产环境中修改
@@ -57,6 +58,7 @@ API_VERSION = settings.API_VERSION
 API_PREFIX = settings.API_PREFIX
 CACHE_TTL = settings.CACHE_TTL
 CACHE_MAX_SIZE = settings.CACHE_MAX_SIZE
+CACHE_SHARDS = settings.CACHE_SHARDS
 SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = settings.ALGORITHM
 ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES

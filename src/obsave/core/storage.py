@@ -66,17 +66,24 @@ class ObjectStorage:
             
     async def _retry_operation(self, operation, *args, **kwargs):
         """重试操作的包装器"""
+        last_exception = None
         for attempt in range(self.max_retries):
             try:
-                return await operation(*args, **kwargs)
+                result = await operation(*args, **kwargs)
+                return result
+            except ObjectNotFoundError as e:
+                # 不重试"对象不存在"错误
+                logger.warning(f"Object not found: {str(e)}")
+                raise
             except Exception as e:
+                last_exception = e
                 with self.stats_lock:
                     self.stats["errors"] += 1
                     self.stats["retries"] += 1
                 
                 if attempt == self.max_retries - 1:
-                    logger.error(f"Operation failed after {self.max_retries} attempts: {str(e)}")
-                    raise StorageError(f"Operation failed: {str(e)}")
+                    logger.error(f"Operation failed after {self.max_retries} attempts: {str(last_exception)}")
+                    raise StorageError(f"Operation failed: {str(last_exception)}")
                     
                 await asyncio.sleep(self.retry_delay * (attempt + 1))
                 logger.warning(f"Retrying operation, attempt {attempt + 2}/{self.max_retries}")
@@ -108,25 +115,36 @@ class ObjectStorage:
                 temp_path = f"{file_path}.tmp"
                 
                 def write_file():
-                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                    with open(temp_path, 'wb') as f:
-                        for i in range(0, len(data), self.chunk_size):
-                            chunk = data[i:i + self.chunk_size]
-                            f.write(chunk)
-                    # 原子性重命名
-                    os.replace(temp_path, file_path)
+                    try:
+                        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                        with open(temp_path, 'wb') as f:
+                            for i in range(0, len(data), self.chunk_size):
+                                chunk = data[i:i + self.chunk_size]
+                                f.write(chunk)
+                        # 原子性重命名
+                        os.replace(temp_path, file_path)
+                        return True
+                    except Exception as e:
+                        logger.error(f"Failed to write file {file_path}: {str(e)}")
+                        if os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except:
+                                pass
+                        return False
                         
-                await asyncio.get_event_loop().run_in_executor(
+                success = await asyncio.get_event_loop().run_in_executor(
                     self.thread_pool,
                     write_file
                 )
                 
-                with self.stats_lock:
-                    self.stats["writes"] += 1
-                    self.stats["total_size"] += len(data)
-                    self.stats["total_files"] += 1
-                    
-                return True
+                if success:
+                    with self.stats_lock:
+                        self.stats["writes"] += 1
+                        self.stats["total_size"] += len(data)
+                        self.stats["total_files"] += 1
+                    return True
+                return False
                 
         except Exception as e:
             logger.error(f"Error storing data for key {key}: {str(e)}")
@@ -143,6 +161,9 @@ class ObjectStorage:
             result = await self._retry_operation(self._get, key)
             metrics_collector.track_storage_operation('get', result is not None)
             return result
+        except ObjectNotFoundError:
+            metrics_collector.track_storage_operation('get', False)
+            raise
         except Exception as e:
             metrics_collector.track_storage_operation('get', False)
             raise
@@ -152,22 +173,30 @@ class ObjectStorage:
             async with self.semaphore:
                 file_path = self._get_file_path(key)
                 if not os.path.exists(file_path):
+                    logger.warning(f"Object not found: {key}")
                     raise ObjectNotFoundError(key)
                     
                 def read_file():
-                    with open(file_path, 'rb') as f:
-                        data = bytearray()
-                        while True:
-                            chunk = f.read(self.chunk_size)
-                            if not chunk:
-                                break
-                            data.extend(chunk)
-                        return bytes(data)
+                    try:
+                        with open(file_path, 'rb') as f:
+                            data = bytearray()
+                            while True:
+                                chunk = f.read(self.chunk_size)
+                                if not chunk:
+                                    break
+                                data.extend(chunk)
+                            return bytes(data)
+                    except Exception as e:
+                        logger.error(f"Failed to read file {file_path}: {str(e)}")
+                        return None
                         
                 data = await asyncio.get_event_loop().run_in_executor(
                     self.thread_pool,
                     read_file
                 )
+                
+                if data is None:
+                    raise StorageError(f"Failed to read object {key}")
                 
                 with self.stats_lock:
                     self.stats["reads"] += 1

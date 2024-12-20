@@ -21,7 +21,7 @@ from jsonpath_ng import parse as parse_jsonpath
 from obsave.core.storage import ObjectStorage
 from obsave.core.exceptions import StorageError, ObjectNotFoundError, ObjSaveException
 from obsave.core.database import get_db, init_db
-from obsave.core.settings import *
+from obsave.core.settings import settings  # Corrected import statement
 from obsave.monitoring.metrics import metrics_collector
 from obsave.monitoring.middleware import PrometheusMiddleware
 from obsave.utils import CacheManager, RequestQueue, WriteManager, AsyncIOManager
@@ -29,58 +29,58 @@ from obsave.core.models import ObjectMetadata, JSONObjectModel, ObjectStorage as
 
 # 配置日志记录
 logger = logging.getLogger("obsave")
-logger.setLevel(getattr(logging, LOG_LEVEL))
+logger.setLevel(getattr(logging, settings.LOG_LEVEL))  # Corrected settings usage
 
 # 创建日志处理器
 file_handler = RotatingFileHandler(
-    LOG_FILE,
-    maxBytes=LOG_MAX_BYTES,
-    backupCount=LOG_BACKUP_COUNT
+    settings.LOG_FILE,  # Corrected settings usage
+    maxBytes=settings.LOG_MAX_BYTES,  # Corrected settings usage
+    backupCount=settings.LOG_BACKUP_COUNT  # Corrected settings usage
 )
-file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+file_handler.setFormatter(logging.Formatter(settings.LOG_FORMAT))  # Corrected settings usage
 logger.addHandler(file_handler)
 
 # 如果不是生产环境，也添加控制台输出
-if LOG_LEVEL == "DEBUG":
+if settings.LOG_LEVEL == "DEBUG":  # Corrected settings usage
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    console_handler.setFormatter(logging.Formatter(settings.LOG_FORMAT))  # Corrected settings usage
     logger.addHandler(console_handler)
 
 # 系统配置
-executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+executor = ThreadPoolExecutor(max_workers=settings.MAX_WORKERS)  # Corrected settings usage
 
 # 创建线程池
 thread_pool = ThreadPoolExecutor(
-    max_workers=MAX_WORKERS * 2,
+    max_workers=settings.MAX_WORKERS * 2,  # Corrected settings usage
     thread_name_prefix="db_worker"
 )
 
 # 创建上传专用线程池
 upload_thread_pool = ThreadPoolExecutor(
-    max_workers=MAX_WORKERS,
+    max_workers=settings.MAX_WORKERS,  # Corrected settings usage
     thread_name_prefix="upload_worker"
 )
 
 # 创建I/O管理器实例
-io_manager = AsyncIOManager(max_workers=MAX_WORKERS)
+io_manager = AsyncIOManager(max_workers=settings.MAX_WORKERS)  # Corrected settings usage
 
-# 创建存储管理器实例
+# 初始化存储实例
 storage = ObjectStorage(
-    base_path=STORAGE_BASE_PATH,
-    chunk_size=CHUNK_SIZE,
-    max_concurrent_ops=MAX_WORKERS
+    base_path=settings.STORAGE_BASE_PATH,  # Corrected settings usage
+    chunk_size=settings.CHUNK_SIZE,  # Corrected settings usage
+    max_concurrent_ops=settings.MAX_WORKERS  # Corrected settings usage
 )
 
-# 创建缓存管理器实例
+# 初始化缓存管理器
 cache = CacheManager(
-    max_items=CACHE_MAX_SIZE,
-    shards=32,
-    ttl=CACHE_TTL
+    max_items=settings.CACHE_MAX_SIZE,  # Corrected settings usage
+    shards=settings.CACHE_SHARDS,  # Corrected settings usage
+    ttl=settings.CACHE_TTL  # Corrected settings usage
 )
 
 # 创建请求队列实例
 request_queue = RequestQueue(
-    max_workers=MAX_WORKERS,
+    max_workers=settings.MAX_WORKERS,  # Corrected settings usage
     max_queue_size=10000
 )
 
@@ -93,15 +93,15 @@ write_manager = WriteManager(
 
 # 创建异步IO管理器实例
 io_manager = AsyncIOManager(
-    max_workers=MAX_WORKERS
+    max_workers=settings.MAX_WORKERS  # Corrected settings usage
 )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up server...")
-    logger.info(f"Available workers: {MAX_WORKERS}")
-    logger.info(f"Cache config: max_items={CACHE_MAX_SIZE}, shards=32, ttl={CACHE_TTL}s")
+    logger.info(f"Available workers: {settings.MAX_WORKERS}")  # Corrected settings usage
+    logger.info(f"Cache config: max_items={settings.CACHE_MAX_SIZE}, shards=32, ttl={settings.CACHE_TTL}s")  # Corrected settings usage
     
     # 初始化数据库
     init_db()
@@ -127,8 +127,8 @@ async def lifespan(app: FastAPI):
 
 # 创建FastAPI应用
 app = FastAPI(
-    title=API_TITLE,
-    description=API_DESCRIPTION,
+    title=settings.API_TITLE,  # Corrected settings usage
+    description=settings.API_DESCRIPTION,  # Corrected settings usage
     version="1.0.0",
     docs_url="/objsave/docs",
     openapi_url="/objsave/openapi.json",
@@ -173,7 +173,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 # 请求信号量，限制并发请求数
-request_semaphore = asyncio.Semaphore(MAX_WORKERS)
+request_semaphore = asyncio.Semaphore(settings.MAX_WORKERS)  # Corrected settings usage
 
 # 请求ID中间件
 @app.middleware("http")
@@ -241,7 +241,7 @@ async def http_metrics_middleware(request: Request, call_next):
 
 # 创建路由器
 router = APIRouter(
-    prefix=API_PREFIX,
+    prefix=settings.API_PREFIX,  # Corrected settings usage
     tags=["object-storage"]
 )
 
@@ -340,10 +340,10 @@ async def upload_object(
     db: Session = Depends(get_db)
 ):
     async with measure_time("upload_object"):
-        if file.size and file.size > MAX_UPLOAD_SIZE:
+        if file.size and file.size > settings.MAX_UPLOAD_SIZE:  # Corrected settings usage
             raise ObjSaveException(
                 status_code=413,
-                detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE} bytes",
+                detail=f"File too large. Maximum size is {settings.MAX_UPLOAD_SIZE} bytes",  # Corrected settings usage
                 error_code="FILE_TOO_LARGE"
             )
         
@@ -390,55 +390,32 @@ async def download_object(
     db: Session = Depends(get_db)
 ):
     """下载指定对象"""
+    request_id = str(uuid.uuid4())
+    logger.debug(f"[{request_id}] Starting download for object: {object_id}")
+    
     try:
-        async def download_task():
-            db_obj = db.query(ObjectStorageModel).filter(ObjectStorageModel.id == object_id).first()
-            if not db_obj:
-                raise HTTPException(status_code=404, detail="Object not found")
-                
-            # 尝试从缓存获取
-            content = cache.get(object_id)
-            if content is None:
-                content = storage.get(object_id)
-                if content is None:
-                    raise HTTPException(status_code=404, detail="Object content not found")
-                    
-            return {
-                "content": content,
-                "media_type": db_obj.content_type,
-                "filename": db_obj.name
-            }
+        # 查询数据库获取对象元数据
+        db_obj = db.query(ObjectStorageModel).filter(ObjectStorageModel.id == object_id).first()
+        if not db_obj:
+            logger.warning(f"[{request_id}] Object not found in database: {object_id}")
+            raise HTTPException(status_code=404, detail="Object not found")
             
-        # 将下载任务加入队列
-        task_id = await request_queue.enqueue(
-            download_task,
-            priority=0,  # 下载请求优先处理
-            is_cpu_bound=False
+        # 返回JSON响应
+        return Response(
+            content=db_obj.content,  # Content is already in correct format (bytes)
+            media_type=db_obj.content_type or 'application/json',
+            headers={
+                "Content-Disposition": f'attachment; filename="{db_obj.name}"',
+                "Content-Length": str(db_obj.size),
+                "Cache-Control": "max-age=3600"
+            }
         )
         
-        # 等待结果
-        while True:
-            result = request_queue.get_result(task_id)
-            if result:
-                if result["status"] == "completed":
-                    data = result["result"]
-                    return Response(
-                        content=data["content"],
-                        media_type=data["media_type"],
-                        headers={
-                            "Content-Disposition": f'attachment; filename="{data["filename"]}"',
-                            "Cache-Control": "max-age=3600"
-                        }
-                    )
-                elif result["status"] == "failed":
-                    raise HTTPException(status_code=500, detail=result["error"])
-            await asyncio.sleep(0.1)
-            
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Download failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="Download failed")
+        logger.error(f"[{request_id}] Download failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
 
 # 列出所有对象接口
 @router.get("/list", response_model=List[ObjectMetadata])
@@ -449,22 +426,22 @@ async def list_objects(
     last_id: Optional[str] = None  # 游标分页
 ):
     """列出存储的对象"""
+    request_id = str(uuid.uuid4())
+    logger.debug(f"[{request_id}] Listing objects: limit={limit}, offset={offset}, last_id={last_id}")
+    
     try:
         cache_key = f"list:last_id={last_id}:limit={limit}:offset={offset}"
         cached_data = cache.get(cache_key)
         if cached_data:
+            logger.debug(f"[{request_id}] Cache hit for {cache_key}")
             return cached_data
             
-        def db_operation():
-            query = db.query(ObjectStorageModel)
-            if last_id:
-                query = query.filter(ObjectStorageModel.id > last_id)
-            return query.order_by(ObjectStorageModel.created_at.desc()).offset(offset).limit(limit).all()
+        # 直接在当前线程执行数据库操作
+        query = db.query(ObjectStorageModel)
+        if last_id:
+            query = query.filter(ObjectStorageModel.id > last_id)
             
-        objects = await asyncio.get_event_loop().run_in_executor(
-            thread_pool, 
-            db_operation
-        )
+        objects = query.order_by(ObjectStorageModel.created_at.desc()).offset(offset).limit(limit).all()
         
         result = [
             ObjectMetadata(
@@ -478,14 +455,15 @@ async def list_objects(
             ) for obj in objects
         ]
         
-        # 缓存结果，设置较短的TTL
+        # 缓存结果
         cache.set(cache_key, result, ttl=60)  # 缓存1分钟
+        logger.debug(f"[{request_id}] Successfully listed {len(result)} objects")
         
         return result
         
     except Exception as e:
-        logger.error(f"Error listing objects: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"获取列表失败: {str(e)}")
+        logger.error(f"[{request_id}] Failed to list objects: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to list objects: {str(e)}")
 
 # JSON对象上传接口
 @router.post("/upload/json", response_model=ObjectMetadata)
@@ -876,5 +854,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        workers=MAX_WORKERS
+        workers=settings.MAX_WORKERS  # Corrected settings usage
     )

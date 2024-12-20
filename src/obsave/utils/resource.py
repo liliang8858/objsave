@@ -191,7 +191,7 @@ class WriteManager:
                     db_object = ObjectStorage(
                         id=record['id'],
                         name=record['name'],
-                        content=record['content'],
+                        content=record['content'].encode('utf-8'),  # Convert to bytes for storage
                         content_type=record['content_type'],
                         type=record['type'],
                         size=record['size'],
