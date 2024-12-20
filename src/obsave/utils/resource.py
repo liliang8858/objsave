@@ -1,8 +1,11 @@
 import psutil
 import time
-from typing import Dict, Any
+import asyncio
+from typing import Dict, Any, List, Optional
 import logging
 from datetime import datetime
+from queue import Queue
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,7 @@ class ResourceManager:
             return False, "内存不足"
             
         return True, ""
-        
+
     def get_available_workers(self) -> int:
         """获取可用的工作线程数"""
         try:
@@ -65,3 +68,126 @@ class ResourceManager:
             return int(total_memory * 0.4)  # 使用40%的系统内存
         except:
             return 2 * 1024 * 1024 * 1024  # 默认2GB
+
+class WriteManager:
+    """写入管理器，用于批量处理写入操作"""
+    
+    def __init__(self, batch_size: int = 100, flush_interval: float = 1.0, max_queue_size: int = 10000):
+        self.batch_size = batch_size
+        self.flush_interval = flush_interval
+        self.max_queue_size = max_queue_size
+        
+        self.queue: Queue = Queue(maxsize=max_queue_size)
+        self.buffer: List[Any] = []
+        self.last_flush = time.time()
+        self._running = False
+        self._lock = threading.Lock()
+        self._flush_event = threading.Event()
+        
+        self.stats = {
+            'total_writes': 0,
+            'total_flushes': 0,
+            'failed_writes': 0,
+            'queue_size': 0,
+            'buffer_size': 0,
+            'start_time': None
+        }
+        
+    def start(self):
+        """启动写入管理器"""
+        if self._running:
+            return
+            
+        self._running = True
+        self.stats['start_time'] = time.time()
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flush_thread.start()
+        logger.info("Write manager started")
+        
+    def stop(self):
+        """停止写入管理器"""
+        if not self._running:
+            return
+            
+        self._running = False
+        self._flush_event.set()  # 触发最后一次刷新
+        if hasattr(self, '_flush_thread'):
+            self._flush_thread.join(timeout=5.0)
+        logger.info("Write manager stopped")
+        
+    async def write(self, data: Any) -> bool:
+        """异步写入数据"""
+        try:
+            if not self._running:
+                raise RuntimeError("Write manager is not running")
+                
+            if self.queue.qsize() >= self.max_queue_size:
+                raise RuntimeError("Write queue is full")
+                
+            self.queue.put(data)
+            self.stats['total_writes'] += 1
+            self.stats['queue_size'] = self.queue.qsize()
+            
+            # 如果队列达到批处理大小，触发刷新
+            if self.queue.qsize() >= self.batch_size:
+                self._flush_event.set()
+                
+            return True
+            
+        except Exception as e:
+            self.stats['failed_writes'] += 1
+            logger.error(f"Write failed: {str(e)}")
+            return False
+            
+    async def flush(self):
+        """强制刷新缓冲区"""
+        if not self._running:
+            return
+            
+        self._flush_event.set()
+        await asyncio.sleep(0.1)  # 给刷新线程一点时间
+        
+    def _flush_loop(self):
+        """刷新循环"""
+        while self._running or not self.queue.empty():
+            try:
+                # 等待触发刷新或达到刷新间隔
+                self._flush_event.wait(timeout=self.flush_interval)
+                self._flush_event.clear()
+                
+                # 获取队列中的所有数据
+                with self._lock:
+                    while not self.queue.empty() and len(self.buffer) < self.batch_size:
+                        try:
+                            item = self.queue.get_nowait()
+                            self.buffer.append(item)
+                        except Exception:
+                            break
+                            
+                    # 如果缓冲区有数据，执行刷新
+                    if self.buffer:
+                        self._flush_buffer()
+                        
+            except Exception as e:
+                logger.error(f"Flush error: {str(e)}")
+                
+    def _flush_buffer(self):
+        """刷新缓冲区"""
+        try:
+            # 这里应该实现具体的写入逻辑
+            # 为了示例，我们只是清空缓冲区
+            self.buffer.clear()
+            
+            self.stats['total_flushes'] += 1
+            self.stats['buffer_size'] = len(self.buffer)
+            
+        except Exception as e:
+            self.stats['failed_writes'] += 1
+            logger.error(f"Buffer flush failed: {str(e)}")
+            
+    def get_stats(self) -> Dict[str, Any]:
+        """获取写入统计信息"""
+        stats = dict(self.stats)
+        if stats['start_time']:
+            stats['uptime'] = time.time() - stats['start_time']
+        return stats
