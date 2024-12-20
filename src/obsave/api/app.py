@@ -21,7 +21,7 @@ from jsonpath_ng import parse as parse_jsonpath
 from obsave.core.storage import ObjectStorage
 from obsave.core.exceptions import StorageError, ObjectNotFoundError, ObjSaveException
 from obsave.core.database import get_db, init_db
-from obsave.core.settings import settings  # Corrected import statement
+from obsave.core.settings import settings  
 from obsave.monitoring.metrics import metrics_collector
 from obsave.monitoring.middleware import PrometheusMiddleware
 from obsave.utils import CacheManager, RequestQueue, WriteManager, AsyncIOManager
@@ -29,58 +29,58 @@ from obsave.core.models import ObjectMetadata, JSONObjectModel, ObjectStorage as
 
 # 配置日志记录
 logger = logging.getLogger("obsave")
-logger.setLevel(getattr(logging, settings.LOG_LEVEL))  # Corrected settings usage
+logger.setLevel(getattr(logging, settings.LOG_LEVEL))  
 
 # 创建日志处理器
 file_handler = RotatingFileHandler(
-    settings.LOG_FILE,  # Corrected settings usage
-    maxBytes=settings.LOG_MAX_BYTES,  # Corrected settings usage
-    backupCount=settings.LOG_BACKUP_COUNT  # Corrected settings usage
+    settings.LOG_FILE,  
+    maxBytes=settings.LOG_MAX_BYTES,  
+    backupCount=settings.LOG_BACKUP_COUNT  
 )
-file_handler.setFormatter(logging.Formatter(settings.LOG_FORMAT))  # Corrected settings usage
+file_handler.setFormatter(logging.Formatter(settings.LOG_FORMAT))  
 logger.addHandler(file_handler)
 
 # 如果不是生产环境，也添加控制台输出
-if settings.LOG_LEVEL == "DEBUG":  # Corrected settings usage
+if settings.LOG_LEVEL == "DEBUG":  
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter(settings.LOG_FORMAT))  # Corrected settings usage
+    console_handler.setFormatter(logging.Formatter(settings.LOG_FORMAT))  
     logger.addHandler(console_handler)
 
 # 系统配置
-executor = ThreadPoolExecutor(max_workers=settings.MAX_WORKERS)  # Corrected settings usage
+executor = ThreadPoolExecutor(max_workers=settings.MAX_WORKERS)  
 
 # 创建线程池
 thread_pool = ThreadPoolExecutor(
-    max_workers=settings.MAX_WORKERS * 2,  # Corrected settings usage
+    max_workers=settings.MAX_WORKERS * 2,  
     thread_name_prefix="db_worker"
 )
 
 # 创建上传专用线程池
 upload_thread_pool = ThreadPoolExecutor(
-    max_workers=settings.MAX_WORKERS,  # Corrected settings usage
+    max_workers=settings.MAX_WORKERS,  
     thread_name_prefix="upload_worker"
 )
 
 # 创建I/O管理器实例
-io_manager = AsyncIOManager(max_workers=settings.MAX_WORKERS)  # Corrected settings usage
+io_manager = AsyncIOManager(max_workers=settings.MAX_WORKERS)  
 
 # 初始化存储实例
 storage = ObjectStorage(
-    base_path=settings.STORAGE_BASE_PATH,  # Corrected settings usage
-    chunk_size=settings.CHUNK_SIZE,  # Corrected settings usage
-    max_concurrent_ops=settings.MAX_WORKERS  # Corrected settings usage
+    base_path=settings.STORAGE_BASE_PATH,  
+    chunk_size=settings.CHUNK_SIZE,  
+    max_concurrent_ops=settings.MAX_WORKERS  
 )
 
 # 初始化缓存管理器
 cache = CacheManager(
-    max_items=settings.CACHE_MAX_SIZE,  # Corrected settings usage
-    shards=settings.CACHE_SHARDS,  # Corrected settings usage
-    ttl=settings.CACHE_TTL  # Corrected settings usage
+    max_items=settings.CACHE_MAX_SIZE,  
+    shards=settings.CACHE_SHARDS,  
+    ttl=settings.CACHE_TTL  
 )
 
 # 创建请求队列实例
 request_queue = RequestQueue(
-    max_workers=settings.MAX_WORKERS,  # Corrected settings usage
+    max_workers=settings.MAX_WORKERS,  
     max_queue_size=10000
 )
 
@@ -93,15 +93,14 @@ write_manager = WriteManager(
 
 # 创建异步IO管理器实例
 io_manager = AsyncIOManager(
-    max_workers=settings.MAX_WORKERS  # Corrected settings usage
+    max_workers=settings.MAX_WORKERS  
 )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up server...")
-    logger.info(f"Available workers: {settings.MAX_WORKERS}")  # Corrected settings usage
-    logger.info(f"Cache config: max_items={settings.CACHE_MAX_SIZE}, shards=32, ttl={settings.CACHE_TTL}s")  # Corrected settings usage
+    logger.info(f"Available workers: {settings.MAX_WORKERS}")  
     
     # 初始化数据库
     init_db()
@@ -119,7 +118,7 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down...")
-    await write_manager.flush()  # 确保所有待写入的数据都已保存
+    await write_manager.flush()  
     write_manager.stop()
     io_manager.stop()
     thread_pool.shutdown(wait=False)
@@ -127,8 +126,8 @@ async def lifespan(app: FastAPI):
 
 # 创建FastAPI应用
 app = FastAPI(
-    title=settings.API_TITLE,  # Corrected settings usage
-    description=settings.API_DESCRIPTION,  # Corrected settings usage
+    title=settings.API_TITLE,  
+    description=settings.API_DESCRIPTION,  
     version="1.0.0",
     docs_url="/objsave/docs",
     openapi_url="/objsave/openapi.json",
@@ -173,7 +172,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 # 请求信号量，限制并发请求数
-request_semaphore = asyncio.Semaphore(settings.MAX_WORKERS)  # Corrected settings usage
+request_semaphore = asyncio.Semaphore(settings.MAX_WORKERS)  
 
 # 请求ID中间件
 @app.middleware("http")
@@ -241,7 +240,7 @@ async def http_metrics_middleware(request: Request, call_next):
 
 # 创建路由器
 router = APIRouter(
-    prefix=settings.API_PREFIX,  # Corrected settings usage
+    prefix=settings.API_PREFIX,  
     tags=["object-storage"]
 )
 
@@ -294,6 +293,9 @@ def validate_jsonpath(path: str) -> bool:
     if not path:
         return False
     try:
+        # 如果路径不是以 $ 开头，自动添加
+        if not path.startswith('$'):
+            path = '$.' + path
         parse_jsonpath(path)
         return True
     except Exception as e:
@@ -340,10 +342,10 @@ async def upload_object(
     db: Session = Depends(get_db)
 ):
     async with measure_time("upload_object"):
-        if file.size and file.size > settings.MAX_UPLOAD_SIZE:  # Corrected settings usage
+        if file.size and file.size > settings.MAX_UPLOAD_SIZE:  
             raise ObjSaveException(
                 status_code=413,
-                detail=f"File too large. Maximum size is {settings.MAX_UPLOAD_SIZE} bytes",  # Corrected settings usage
+                detail=f"File too large. Maximum size is {settings.MAX_UPLOAD_SIZE} bytes",  
                 error_code="FILE_TOO_LARGE"
             )
         
@@ -402,7 +404,7 @@ async def download_object(
             
         # 返回JSON响应
         return Response(
-            content=db_obj.content,  # Content is already in correct format (bytes)
+            content=db_obj.content,  
             media_type=db_obj.content_type or 'application/json',
             headers={
                 "Content-Disposition": f'attachment; filename="{db_obj.name}"',
@@ -423,7 +425,7 @@ async def list_objects(
     db: Session = Depends(get_db),
     limit: Optional[int] = 100,
     offset: Optional[int] = 0,
-    last_id: Optional[str] = None  # 游标分页
+    last_id: Optional[str] = None  
 ):
     """列出存储的对象"""
     request_id = str(uuid.uuid4())
@@ -456,7 +458,7 @@ async def list_objects(
         ]
         
         # 缓存结果
-        cache.set(cache_key, result, ttl=60)  # 缓存1分钟
+        cache.set(cache_key, result, ttl=60)  
         logger.debug(f"[{request_id}] Successfully listed {len(result)} objects")
         
         return result
@@ -549,7 +551,7 @@ async def upload_json_objects_batch(
             content_str = json.dumps(json_data.content)
             content_size = len(content_str.encode('utf-8'))
             
-            if content_size > 10 * 1024 * 1024:  # 10MB限制
+            if content_size > 10 * 1024 * 1024:  
                 logger.warning(f"[{request_id}] Object too large: {content_size} bytes")
                 continue
                 
@@ -622,7 +624,7 @@ async def update_json_object(
         content_str = json.dumps(json_data.content)
         content_size = len(content_str.encode('utf-8'))
         
-        if content_size > 10 * 1024 * 1024:  # 10MB限制
+        if content_size > 10 * 1024 * 1024:  
             logger.warning(f"[{request_id}] Content too large: {content_size} bytes")
             raise HTTPException(status_code=413, detail="Content too large")
             
@@ -675,13 +677,24 @@ async def query_json_objects(
 ):
     """根据 JSONPath 查询和过滤 JSON 对象"""
     request_id = str(uuid.uuid4())
-    logger.debug(f"[{request_id}] Starting query with path: {query.jsonpath}")
+    
+    # 确保 JSONPath 以 $ 开头
+    if not query.jsonpath.startswith('$'):
+        query.jsonpath = '$.' + query.jsonpath
+        
+    logger.debug(f"[{request_id}] Starting query with path: {query.jsonpath}, type: {query.type}, value: {query.value}, operator: {query.operator}")
     
     try:
         # 验证 JSONPath
         if not validate_jsonpath(query.jsonpath):
             logger.warning(f"[{request_id}] Invalid JSONPath: {query.jsonpath}")
-            raise HTTPException(status_code=422, detail="Invalid JSONPath")
+            raise HTTPException(
+                status_code=422, 
+                detail={
+                    "error": "Invalid JSONPath",
+                    "message": "请确保 JSONPath 正确匹配数据结构。例如：如果要查询根级别的 'pageId'，使用 '$.pageId' 而不是 '$.content.pageId'"
+                }
+            )
             
         # 编译 JSONPath 表达式
         jsonpath_expr = parse_jsonpath(query.jsonpath)
@@ -698,7 +711,12 @@ async def query_json_objects(
         # 执行查询
         try:
             objects = base_query.offset(offset).limit(limit).all()
-            logger.debug(f"[{request_id}] Found {len(objects)} objects")
+            logger.debug(f"[{request_id}] Found {len(objects)} objects from database")
+            
+            # 输出找到的对象的基本信息
+            for obj in objects:
+                logger.debug(f"[{request_id}] Found object: id={obj.id}, type={obj.type}, content={obj.content[:200]}...")
+                
         except Exception as e:
             logger.error(f"[{request_id}] Database error: {str(e)}")
             raise HTTPException(status_code=500, detail="Database error")
@@ -708,22 +726,39 @@ async def query_json_objects(
         for obj in objects:
             try:
                 content = json.loads(obj.content)
-                # 使用 jsonpath 过滤
+                logger.debug(f"[{request_id}] Parsed content for object {obj.id}: {json.dumps(content, indent=2)}")
+                
+                # 使用 jsonpath 过滤，但是只在 content 字段内查找
                 matches = [match.value for match in jsonpath_expr.find(content)]
+                logger.debug(f"[{request_id}] JSONPath matches for object {obj.id}: {matches}")
+                
                 if matches:
                     # 如果指定了值和操作符，进行进一步过滤
                     if query.value is not None:
-                        if query.operator == 'eq' and not any(x == query.value for x in matches):
-                            continue
-                        elif query.operator == 'ne' and not any(x != query.value for x in matches):
-                            continue
-                        elif query.operator == 'gt' and not any(x > query.value for x in matches):
-                            continue
-                        elif query.operator == 'lt' and not any(x < query.value for x in matches):
-                            continue
-                        elif query.operator == 'gte' and not any(x >= query.value for x in matches):
-                            continue
-                        elif query.operator == 'lte' and not any(x <= query.value for x in matches):
+                        match_found = False
+                        for x in matches:
+                            logger.debug(f"[{request_id}] Comparing value: {x} {query.operator} {query.value}")
+                            if query.operator == 'eq' and x == query.value:
+                                match_found = True
+                                break
+                            elif query.operator == 'ne' and x != query.value:
+                                match_found = True
+                                break
+                            elif query.operator == 'gt' and x > query.value:
+                                match_found = True
+                                break
+                            elif query.operator == 'lt' and x < query.value:
+                                match_found = True
+                                break
+                            elif query.operator == 'gte' and x >= query.value:
+                                match_found = True
+                                break
+                            elif query.operator == 'lte' and x <= query.value:
+                                match_found = True
+                                break
+                                
+                        if not match_found:
+                            logger.debug(f"[{request_id}] No matching value found for object {obj.id}")
                             continue
                             
                     results.append(JSONObjectResponse(
@@ -735,8 +770,9 @@ async def query_json_objects(
                         type=obj.type,
                         content=content
                     ))
-            except json.JSONDecodeError:
-                logger.warning(f"[{request_id}] Invalid JSON in object {obj.id}")
+                    logger.debug(f"[{request_id}] Added object {obj.id} to results")
+            except json.JSONDecodeError as e:
+                logger.warning(f"[{request_id}] Invalid JSON in object {obj.id}: {str(e)}")
                 continue
             except Exception as e:
                 logger.error(f"[{request_id}] Error processing object {obj.id}: {str(e)}")
@@ -854,5 +890,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        workers=settings.MAX_WORKERS  # Corrected settings usage
+        workers=settings.MAX_WORKERS  
     )
