@@ -21,4 +21,5 @@ isort>=5.9.3
 flake8>=3.9.2
 mypy>=0.910
 coverage>=5.5
-pywin32==306
+pywin32==306; sys_platform == 'win32'  # Windows only dependency
+python-magic-bin==0.4.14; sys_platform == 'win32'  # Windows only dependency for file type detection

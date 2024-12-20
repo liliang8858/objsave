@@ -4,10 +4,12 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, APIRouter, Request, Response, BackgroundTasks
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import time
 import asyncio
@@ -16,130 +18,150 @@ import multiprocessing
 from contextlib import asynccontextmanager
 
 from obsave.core.storage import ObjectStorage
-from obsave.core.exceptions import StorageError, ObjectNotFoundError
+from obsave.core.exceptions import StorageError, ObjectNotFoundError, ObjSaveException
 from obsave.core.database import get_db, init_db
+from obsave.core.settings import *
 from obsave.monitoring.metrics import metrics_collector
 from obsave.monitoring.middleware import PrometheusMiddleware
+from obsave.utils import CacheManager, RequestQueue, WriteManager, AsyncIOManager
 
 # 配置日志记录
+os.makedirs(LOG_DIR, exist_ok=True)
+
 logging.basicConfig(
-    level=logging.WARNING,  # 生产环境使用WARNING级别
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=getattr(logging, LOG_LEVEL),
+    format=LOG_FORMAT,
     handlers=[
         logging.StreamHandler(),
         RotatingFileHandler(
-            'objsave.log',
-            maxBytes=10*1024*1024,  # 10MB
-            backupCount=5
+            LOG_FILE,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding='utf-8'
         )
     ]
 )
 logger = logging.getLogger(__name__)
 
 # 系统配置
-MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
-MAX_WORKERS = min(32, multiprocessing.cpu_count() * 4)
-CHUNK_SIZE = 64 * 1024  # 64KB chunks
-CACHE_MAX_ITEMS = 20000
-CACHE_SHARDS = 32
-CACHE_TTL = 3600
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # 创建线程池
 thread_pool = ThreadPoolExecutor(
-    max_workers=settings.MAX_WORKERS * 2,
+    max_workers=MAX_WORKERS * 2,
     thread_name_prefix="db_worker"
 )
 
 # 创建上传专用线程池
 upload_thread_pool = ThreadPoolExecutor(
-    max_workers=settings.MAX_WORKERS,
+    max_workers=MAX_WORKERS,
     thread_name_prefix="upload_worker"
 )
 
+# 创建I/O管理器实例
+io_manager = AsyncIOManager(max_workers=MAX_WORKERS)
+
 # 创建存储管理器实例
-storage = StorageManager(
-    base_path=settings.STORAGE_BASE_PATH,
-    chunk_size=settings.CHUNK_SIZE,
-    max_concurrent_ops=settings.MAX_WORKERS
+storage = ObjectStorage(
+    base_path=STORAGE_BASE_PATH,
+    chunk_size=CHUNK_SIZE,
+    max_concurrent_ops=MAX_WORKERS
 )
 
 # 创建缓存管理器实例
 cache = CacheManager(
-    max_items=settings.CACHE_MAX_ITEMS,
-    shards=settings.CACHE_SHARDS,
-    ttl=settings.CACHE_TTL
+    max_items=CACHE_MAX_ITEMS,
+    shards=CACHE_SHARDS,
+    ttl=CACHE_TTL
 )
 
 # 创建请求队列实例
 request_queue = RequestQueue(
-    max_workers=settings.MAX_WORKERS
+    max_workers=MAX_WORKERS
 )
 
 # 全局写入管理器
 write_manager = WriteManager(
-    batch_size=100,      # 每批次100条记录
-    flush_interval=1.0,  # 每秒刷新一次
-    max_queue_size=10000 # 最大队列大小
+    batch_size=WRITE_BATCH_SIZE,
+    flush_interval=WRITE_FLUSH_INTERVAL,
+    max_queue_size=WRITE_MAX_QUEUE_SIZE
 )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up server...")
-    logger.info(f"Available workers: {settings.MAX_WORKERS}")
-    logger.info(f"Cache config: max_items={settings.CACHE_MAX_ITEMS}, shards={settings.CACHE_SHARDS}, ttl={settings.CACHE_TTL}s")
+    logger.info(f"Available workers: {MAX_WORKERS}")
+    logger.info(f"Cache config: max_items={CACHE_MAX_ITEMS}, shards={CACHE_SHARDS}, ttl={CACHE_TTL}s")
     
     # 初始化数据库
     init_db()
     
-    # 启动请求队列处理器
-    await request_queue.start()
+    # 启动I/O管理器
+    io_manager.start()
     
     # 启动写入管理器
-    await write_manager.start()
+    write_manager.start()
+    
+    # 启动请求队列处理器
+    await request_queue.start()
     
     yield
     
     # Shutdown
     logger.info("Shutting down...")
+    await write_manager.flush()  # 确保所有待写入的数据都已保存
+    write_manager.stop()
+    io_manager.stop()
     thread_pool.shutdown(wait=False)
     upload_thread_pool.shutdown(wait=False)
-    
-    # 关闭写入管理器
-    await write_manager.stop()
 
 # 创建FastAPI应用
 app = FastAPI(
-    title="ObjSave API",
-    description="""
-    # ObjSave 对象存储服务
-
-    ObjSave是一个高性能的对象存储服务，提供以下主要功能：
-
-    ## 核心功能
-    * 文件上传和下载
-    * JSON对象存储和查询
-    * 数据备份和恢复
-    * 性能监控
-
-    ## 技术特点
-    * 高并发处理
-    * 异步IO操作
-    * 缓存优化
-    * 实时监控
-    
-    ## 使用说明
-    所有API端点都以 `/objsave` 为前缀。详细的API文档请参考下面的接口说明。
-    """,
-    version="1.0.0",
-    lifespan=lifespan,
-    docs_url="/objsave/docs",
-    redoc_url="/objsave/redoc",
-    openapi_url="/objsave/openapi.json"
+    title=API_TITLE,
+    description=API_DESCRIPTION,
+    version=API_VERSION,
+    lifespan=lifespan
 )
 
+# CORS中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# GZip中间件
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# 异常处理中间件
+@app.exception_handler(ObjSaveException)
+async def objsave_exception_handler(request: Request, exc: ObjSaveException):
+    logger.error(f"Request failed: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error_code": exc.error_code,
+            "detail": exc.detail
+        }
+    )
+
+# 全局异常处理
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception occurred")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error_code": "INTERNAL_ERROR",
+            "detail": "An internal server error occurred"
+        }
+    )
+
 # 请求信号量，限制并发请求数
-request_semaphore = asyncio.Semaphore(settings.MAX_WORKERS)
+request_semaphore = asyncio.Semaphore(MAX_WORKERS)
 
 # 请求ID中间件
 @app.middleware("http")
@@ -194,45 +216,9 @@ async def http_metrics_middleware(request: Request, call_next):
     
     return response
 
-# CORS中间件
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# GZip中间件
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-
-# 异常处理中间件
-@app.exception_handler(ObjSaveException)
-async def objsave_exception_handler(request: Request, exc: ObjSaveException):
-    logger.error(f"Request failed: {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error_code": exc.error_code,
-            "detail": exc.detail
-        }
-    )
-
-# 全局异常处理
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled exception occurred")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error_code": "INTERNAL_ERROR",
-            "detail": "An internal server error occurred"
-        }
-    )
-
 # 创建路由器
 router = APIRouter(
-    prefix="/objsave",
+    prefix=API_PREFIX,
     tags=["object-storage"]
 )
 
@@ -666,10 +652,10 @@ async def upload_object(
     db: Session = Depends(get_db)
 ):
     async with measure_time("upload_object"):
-        if file.size and file.size > settings.MAX_UPLOAD_SIZE:
+        if file.size and file.size > MAX_UPLOAD_SIZE:
             raise ObjSaveException(
                 status_code=413,
-                detail=f"File too large. Maximum size is {settings.MAX_UPLOAD_SIZE} bytes",
+                detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE} bytes",
                 error_code="FILE_TOO_LARGE"
             )
         
@@ -1182,5 +1168,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        workers=settings.MAX_WORKERS
+        workers=MAX_WORKERS
     )
