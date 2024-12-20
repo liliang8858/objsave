@@ -115,6 +115,10 @@ class WriteManager:
             self._flush_thread.join(timeout=5.0)
         logger.info("Write manager stopped")
         
+    async def add_record(self, data: Any) -> bool:
+        """异步添加记录"""
+        return await self.write(data)
+        
     async def write(self, data: Any) -> bool:
         """异步写入数据"""
         try:

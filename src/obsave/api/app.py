@@ -24,6 +24,7 @@ from obsave.core.settings import *
 from obsave.monitoring.metrics import metrics_collector
 from obsave.monitoring.middleware import PrometheusMiddleware
 from obsave.utils import CacheManager, RequestQueue, WriteManager, AsyncIOManager
+from obsave.core.models import ObjectMetadata, JSONObjectModel, ObjectStorage as ObjectStorageModel
 
 # 配置日志记录
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -120,7 +121,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=API_TITLE,
     description=API_DESCRIPTION,
-    version=API_VERSION,
+    version="1.0.0",
+    docs_url="/objsave/docs",
+    openapi_url="/objsave/openapi.json",
+    redoc_url="/objsave/redoc",
     lifespan=lifespan
 )
 
@@ -197,24 +201,35 @@ async def timeout_middleware(request: Request, call_next):
 async def http_metrics_middleware(request: Request, call_next):
     """HTTP请求指标收集中间件"""
     start_time = time.time()
-    response = await call_next(request)
-    duration = time.time() - start_time
     
-    # 获取响应大小
-    size = 0
-    if hasattr(response, 'body'):
-        size = len(response.body)
-    
-    # 记录请求指标
-    metrics.http.record_request(
+    # 记录请求开始
+    metrics_collector.track_request(
         method=request.method,
-        path=request.url.path,
-        status_code=response.status_code,
-        duration=duration * 1000,  # 转换为毫秒
-        size=size
+        endpoint=request.url.path
     )
     
-    return response
+    try:
+        response = await call_next(request)
+        
+        # 记录请求结束
+        metrics_collector.track_request_end(
+            start_time=start_time,
+            method=request.method,
+            endpoint=request.url.path,
+            status=response.status_code
+        )
+        
+        return response
+        
+    except Exception as e:
+        # 记录失败请求
+        metrics_collector.track_request_end(
+            start_time=start_time,
+            method=request.method,
+            endpoint=request.url.path,
+            status=500
+        )
+        raise
 
 # 创建路由器
 router = APIRouter(
@@ -229,6 +244,8 @@ class ObjectMetadata(BaseModel):
     content_type: str
     size: int
     created_at: str
+    type: Optional[str] = None
+    owner: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -704,7 +721,7 @@ async def download_object(
     """下载指定对象"""
     try:
         async def download_task():
-            db_obj = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
+            db_obj = db.query(ObjectStorageModel).filter(ObjectStorageModel.id == object_id).first()
             if not db_obj:
                 raise HTTPException(status_code=404, detail="Object not found")
                 
@@ -768,10 +785,10 @@ async def list_objects(
             return cached_data
             
         def db_operation():
-            query = db.query(ObjectStorage)
+            query = db.query(ObjectStorageModel)
             if last_id:
-                query = query.filter(ObjectStorage.id > last_id)
-            return query.offset(offset).limit(limit).all()
+                query = query.filter(ObjectStorageModel.id > last_id)
+            return query.order_by(ObjectStorageModel.created_at.desc()).offset(offset).limit(limit).all()
             
         objects = await asyncio.get_event_loop().run_in_executor(
             thread_pool, 
@@ -784,7 +801,9 @@ async def list_objects(
                 name=obj.name,
                 content_type=obj.content_type,
                 size=obj.size,
-                created_at=str(obj.created_at)
+                created_at=obj.created_at.isoformat(),
+                type=obj.type,
+                owner=obj.owner
             ) for obj in objects
         ]
         
@@ -885,7 +904,7 @@ async def upload_json_objects_batch(
                 logger.warning(f"[{request_id}] Object too large: {content_size} bytes")
                 continue
                 
-            db_object = ObjectStorage(
+            db_object = ObjectStorageModel(
                 id=str(uuid.uuid4()),
                 name=json_data.name or f"json_object_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                 content=content_str,
@@ -945,7 +964,7 @@ async def update_json_object(
     
     try:
         # 查找对象
-        db_object = db.query(ObjectStorage).filter(ObjectStorage.id == object_id).first()
+        db_object = db.query(ObjectStorageModel).filter(ObjectStorageModel.id == object_id).first()
         if not db_object:
             logger.warning(f"[{request_id}] Object {object_id} not found")
             raise HTTPException(status_code=404, detail="Object not found")
@@ -1016,13 +1035,13 @@ async def query_json_objects(
             raise HTTPException(status_code=422, detail="Invalid JSONPath")
             
         # 基础查询
-        base_query = db.query(ObjectStorage).filter(
-            ObjectStorage.content_type == "application/json"
+        base_query = db.query(ObjectStorageModel).filter(
+            ObjectStorageModel.content_type == "application/json"
         )
         
         # 添加类型过滤
         if query.type:
-            base_query = base_query.filter(ObjectStorage.type == query.type)
+            base_query = base_query.filter(ObjectStorageModel.type == query.type)
             
         # 执行查询
         try:

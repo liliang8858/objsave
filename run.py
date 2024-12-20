@@ -6,10 +6,10 @@ from obsave.core.settings import MAX_WORKERS
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "obsave.api.app:app",
+        app,
         host="0.0.0.0",
         port=8000,
         reload=True,
-        workers=MAX_WORKERS,
+        workers=1,  # 开发模式使用单个worker
         log_level="info"
     )
