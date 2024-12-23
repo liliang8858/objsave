@@ -31,6 +31,8 @@ from datetime import datetime, timedelta
 from jsonpath_ng import parse as parse_jsonpath
 from sqlalchemy.exc import SQLAlchemyError
 import threading
+from queue import Queue, Empty
+import threading
 
 from obsave.core.storage import ObjectStorage
 from obsave.core.exceptions import StorageError, ObjectNotFoundError, ObjSaveException
@@ -104,97 +106,219 @@ class CacheKeyManager:
         self._query_objects = {}
         # 用于存储列表缓存键
         self._list_cache_keys = set()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # 使用可重入锁
         
     def add_object_cache_key(self, object_id: str, cache_key: str):
         """添加对象相关的缓存键"""
-        with self._lock:
-            if object_id not in self._object_cache_keys:
-                self._object_cache_keys[object_id] = set()
-            self._object_cache_keys[object_id].add(cache_key)
+        try:
+            with self._lock:
+                if object_id not in self._object_cache_keys:
+                    self._object_cache_keys[object_id] = set()
+                self._object_cache_keys[object_id].add(cache_key)
+        except Exception as e:
+            logger.error(f"Error adding object cache key: {str(e)}")
             
     def add_query_result(self, cache_key: str, object_ids: List[str]):
         """记录查询结果中包含的对象ID"""
-        with self._lock:
-            self._query_objects[cache_key] = set(object_ids)
-            # 为每个对象添加反向引用
-            for obj_id in object_ids:
-                self.add_object_cache_key(obj_id, cache_key)
-                
+        if not object_ids:
+            return
+            
+        try:
+            with self._lock:
+                self._query_objects[cache_key] = set(object_ids)
+                # 为每个对象添加反向引用
+                for obj_id in object_ids:
+                    if obj_id not in self._object_cache_keys:
+                        self._object_cache_keys[obj_id] = set()
+                    self._object_cache_keys[obj_id].add(cache_key)
+        except Exception as e:
+            logger.error(f"Error adding query result: {str(e)}")
+            
     def add_list_cache_key(self, cache_key: str):
         """添加列表缓存键"""
-        with self._lock:
-            self._list_cache_keys.add(cache_key)
+        try:
+            with self._lock:
+                self._list_cache_keys.add(cache_key)
+        except Exception as e:
+            logger.error(f"Error adding list cache key: {str(e)}")
             
     def get_related_cache_keys(self, object_id: str) -> Set[str]:
         """获取与对象相关的所有缓存键"""
-        with self._lock:
-            # 直接相关的缓存键
-            related_keys = self._object_cache_keys.get(object_id, set()).copy()
-            # 包含该对象的查询结果缓存键
-            for query_key, obj_ids in self._query_objects.items():
-                if object_id in obj_ids:
-                    related_keys.add(query_key)
-            return related_keys
+        try:
+            with self._lock:
+                # 直接相关的缓存键
+                related_keys = self._object_cache_keys.get(object_id, set()).copy()
+                # 包含该对象的查询结果缓存键
+                for query_key, obj_ids in self._query_objects.items():
+                    if object_id in obj_ids:
+                        related_keys.add(query_key)
+                return related_keys
+        except Exception as e:
+            logger.error(f"Error getting related cache keys: {str(e)}")
+            return set()
             
-    def clear_object_cache_keys(self, object_id: str):
+    def clear_object_cache_keys(self, object_id: str) -> Set[str]:
         """清除对象相关的所有缓存键记录"""
-        with self._lock:
-            # 获取所有相关的缓存键
-            related_keys = self.get_related_cache_keys(object_id)
-            # 从所有映射中删除这些键
-            self._object_cache_keys.pop(object_id, None)
-            for key in list(self._query_objects.keys()):
-                if key in related_keys:
-                    self._query_objects.pop(key)
-            return related_keys
+        try:
+            with self._lock:
+                # 获取所有相关的缓存键
+                related_keys = self.get_related_cache_keys(object_id)
+                # 从所有映射中删除这些键
+                self._object_cache_keys.pop(object_id, None)
+                keys_to_remove = []
+                for key in self._query_objects:
+                    if key in related_keys:
+                        keys_to_remove.append(key)
+                for key in keys_to_remove:
+                    self._query_objects.pop(key, None)
+                return related_keys
+        except Exception as e:
+            logger.error(f"Error clearing object cache keys: {str(e)}")
+            return set()
             
     def clear_all(self):
         """清除所有缓存键记录"""
-        with self._lock:
-            self._object_cache_keys.clear()
-            self._query_objects.clear()
-            self._list_cache_keys.clear()
+        try:
+            with self._lock:
+                self._object_cache_keys.clear()
+                self._query_objects.clear()
+                self._list_cache_keys.clear()
+        except Exception as e:
+            logger.error(f"Error clearing all cache keys: {str(e)}")
+
+class AsyncCacheInvalidator:
+    """异步缓存清理器"""
+    
+    def __init__(self):
+        self._queue = Queue()
+        self._thread = threading.Thread(target=self._process_queue, daemon=True)
+        self._running = True
+        self._thread.start()
+        
+    def _process_queue(self):
+        """处理缓存清理队列"""
+        while self._running:
+            try:
+                # 从队列获取任务，最多等待1秒
+                task = self._queue.get(timeout=1)
+                if task is None:
+                    continue
+                    
+                object_id, operation = task
+                logger.debug(f"Processing async cache invalidation for object {object_id}, operation: {operation}")
+                
+                try:
+                    # 获取所有相关的缓存键
+                    related_keys = cache_key_manager.get_related_cache_keys(object_id)
+                    
+                    # 删除对象的直接缓存
+                    safe_cache_pop(query_cache, f"content:{object_id}")
+                    safe_cache_pop(metadata_cache, f"metadata:{object_id}")
+                    
+                    # 删除所有相关的查询缓存
+                    for key in related_keys:
+                        safe_cache_pop(query_cache, key)
+                        safe_cache_pop(list_cache, key)
+                    
+                    # 清除缓存键记录
+                    cache_key_manager.clear_object_cache_keys(object_id)
+                    logger.info(f"Async cache invalidation completed for object {object_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Error in async cache invalidation for object {object_id}: {str(e)}")
+                    
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in cache invalidation thread: {str(e)}")
+                
+    def invalidate(self, object_id: str, operation: str):
+        """添加缓存失效任务到队列"""
+        try:
+            self._queue.put_nowait((object_id, operation))
+            logger.debug(f"Queued cache invalidation for object {object_id}, operation: {operation}")
+        except Exception as e:
+            logger.error(f"Error queuing cache invalidation: {str(e)}")
+            
+    def stop(self):
+        """停止缓存清理线程"""
+        self._running = False
+        self._thread.join(timeout=5)
+
+def safe_cache_pop(cache, key: str) -> None:
+    """安全地删除缓存值"""
+    try:
+        cache.pop(key, None)
+    except Exception as e:
+        logger.error(f"Error popping cache for key {key}: {str(e)}")
+
+def invalidate_cache(object_id: Optional[str] = None):
+    """使缓存失效"""
+    try:
+        if object_id:
+            # 获取所有相关的缓存键
+            related_keys = cache_key_manager.get_related_cache_keys(object_id)
+            
+            # 删除对象的直接缓存
+            try:
+                query_cache.pop(f"content:{object_id}", None)
+            except Exception:
+                pass
+                
+            try:
+                metadata_cache.pop(f"metadata:{object_id}", None)
+            except Exception:
+                pass
+            
+            # 删除所有相关的查询缓存
+            for key in related_keys:
+                try:
+                    query_cache.pop(key, None)
+                except Exception:
+                    pass
+                try:
+                    list_cache.pop(key, None)
+                except Exception:
+                    pass
+            
+            # 清除缓存键记录
+            cache_key_manager.clear_object_cache_keys(object_id)
+            logger.info(f"Cache invalidated for object {object_id} and related queries")
+        else:
+            # 删除所有缓存
+            try:
+                query_cache.clear()
+                list_cache.clear()
+                metadata_cache.clear()
+                cache_key_manager.clear_all()
+                logger.info("All caches invalidated")
+            except Exception as e:
+                logger.error(f"Error clearing all caches: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error in invalidate_cache: {str(e)}")
+
+def safe_cache_set(cache, key: str, value: Any):
+    """安全地设置缓存值"""
+    try:
+        cache[key] = value
+        return True
+    except Exception as e:
+        logger.error(f"Error setting cache for key {key}: {str(e)}")
+        return False
+
+def safe_cache_get(cache, key: str) -> Optional[Any]:
+    """安全地获取缓存值"""
+    try:
+        return cache.get(key)
+    except Exception as e:
+        logger.error(f"Error getting cache for key {key}: {str(e)}")
+        return None
 
 # 初始化缓存和缓存键管理器
 query_cache = TTLCache(maxsize=CACHE_CONFIG['MAX_SIZE'], ttl=CACHE_CONFIG['QUERY_TTL'])
 list_cache = TTLCache(maxsize=CACHE_CONFIG['MAX_SIZE'], ttl=CACHE_CONFIG['LIST_TTL'])
 metadata_cache = TTLCache(maxsize=CACHE_CONFIG['MAX_SIZE'], ttl=CACHE_CONFIG['METADATA_TTL'])
 cache_key_manager = CacheKeyManager()
-
-def invalidate_cache(object_id: Optional[str] = None):
-    """使缓存失效"""
-    if object_id:
-        # 获取所有相关的缓存键
-        related_keys = cache_key_manager.get_related_cache_keys(object_id)
-        
-        # 删除对象的直接缓存
-        query_cache.pop(f"content:{object_id}", None)
-        metadata_cache.pop(f"metadata:{object_id}", None)
-        
-        # 删除所有相关的查询缓存
-        for key in related_keys:
-            query_cache.pop(key, None)
-            list_cache.pop(key, None)
-            
-        # 清除缓存键记录
-        cache_key_manager.clear_object_cache_keys(object_id)
-        logger.info(f"Cache invalidated for object {object_id} and related queries")
-    else:
-        # 删除所有缓存
-        query_cache.clear()
-        list_cache.clear()
-        metadata_cache.clear()
-        cache_key_manager.clear_all()
-        logger.info("All caches invalidated")
-
-def clear_all_caches():
-    """清除所有缓存"""
-    query_cache.clear()
-    list_cache.clear()
-    metadata_cache.clear()
-    cache_key_manager.clear_all()
-    logger.info("All caches cleared")
 
 # 初始化缓存管理器
 cache = CacheManager(
@@ -502,8 +626,8 @@ async def upload_object(
             metrics.record("objects_uploaded_total", 1)
             metrics.record("bytes_uploaded_total", file.size)
             
-            # 立即使缓存失效
-            invalidate_cache()
+            # 异步触发缓存清理
+            cache_invalidator.invalidate(object_id, "create")
             
             return metadata
             
@@ -658,8 +782,8 @@ async def upload_json_object(
         
         logger.info(f"[{request_id}] Upload queued successfully")
         
-        # 立即使缓存失效
-        invalidate_cache()
+        # 异步触发缓存清理
+        cache_invalidator.invalidate(object_id, "create")
         
         return metadata
         
@@ -734,8 +858,9 @@ async def upload_json_objects_batch(
             
         logger.info(f"[{request_id}] Successfully uploaded {len(metadata_list)} objects")
         
-        # 立即使缓存失效
-        invalidate_cache()
+        # 异步触发缓存清理
+        for obj in db_objects:
+            cache_invalidator.invalidate(obj.id, "create")
         
         return metadata_list
         
@@ -800,8 +925,8 @@ async def update_json_object(
             
         logger.info(f"[{request_id}] Successfully updated object {object_id}")
         
-        # 立即使缓存失效
-        invalidate_cache(object_id)
+        # 异步触发缓存清理
+        cache_invalidator.invalidate(object_id, "update")
         
         return metadata
         
@@ -841,8 +966,8 @@ def update_json_object(
             db.expire_all()
             # 刷新对象
             db.refresh(db_object)
-            # 立即使缓存失效
-            invalidate_cache(object_id)
+            # 异步触发缓存清理
+            cache_invalidator.invalidate(object_id, "update")
             
             logger.info(f"Successfully updated JSON object {object_id}")
             return db_object
@@ -901,7 +1026,7 @@ def query_json_objects(
         logger.debug(f"[{request_id}] Cache key generated: {cache_key}")
         
         # 尝试从缓存获取结果
-        cached_result = query_cache.get(cache_key)
+        cached_result = safe_cache_get(query_cache, cache_key)
         if cached_result:
             logger.info(f"[{request_id}] Cache hit, returning cached result")
             return cached_result
@@ -1035,14 +1160,15 @@ def query_json_objects(
                 "items": results
             }
             
-            # 缓存结果（设置较短的过期时间，因为数据可能会更新）
+            # 缓存结果
             if total_count > 0:
-                try:
-                    query_cache[cache_key] = response_data
-                    cache_key_manager.add_query_result(cache_key, [obj.id for obj, _ in filtered_objects])
+                if safe_cache_set(query_cache, cache_key, response_data):
+                    # 只在缓存成功时记录缓存关系
+                    cache_key_manager.add_query_result(
+                        cache_key,
+                        [obj.id for obj, _ in filtered_objects]
+                    )
                     logger.debug(f"[{request_id}] Results cached with key {cache_key}")
-                except Exception as e:
-                    logger.warning(f"[{request_id}] Failed to cache results: {str(e)}")
             
             return response_data
             
@@ -1197,6 +1323,14 @@ app.include_router(router)
 @app.on_event("startup")
 async def start_metrics_collector():
     asyncio.create_task(start_metrics_collection())
+
+# 初始化异步缓存清理器
+cache_invalidator = AsyncCacheInvalidator()
+
+# 在应用关闭时停止缓存清理线程
+@app.on_event("shutdown")
+def shutdown_event():
+    cache_invalidator.stop()
 
 if __name__ == "__main__":
     import uvicorn
