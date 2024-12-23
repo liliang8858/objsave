@@ -17,6 +17,18 @@ from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 from contextlib import asynccontextmanager
 from jsonpath_ng import parse as parse_jsonpath
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Query, Body
+from fastapi.responses import FileResponse, JSONResponse
+from typing import List, Optional, Dict, Any, Union
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+import json
+import uuid
+import logging
+import os
+from cachetools import TTLCache
+from datetime import datetime, timedelta
+from jsonpath_ng import parse as parse_jsonpath
 
 from obsave.core.storage import ObjectStorage
 from obsave.core.exceptions import StorageError, ObjectNotFoundError, ObjSaveException
@@ -95,6 +107,23 @@ write_manager = WriteManager(
 io_manager = AsyncIOManager(
     max_workers=settings.MAX_WORKERS  
 )
+
+# 初始化缓存
+# maxsize: 最大缓存条目数
+# ttl: 缓存过期时间（秒）
+cache = TTLCache(maxsize=1000, ttl=60)
+
+def validate_jsonpath(jsonpath: str) -> bool:
+    """验证 JSONPath 表达式的有效性"""
+    try:
+        parse_jsonpath(jsonpath)
+        return True
+    except Exception:
+        return False
+
+def clear_cache():
+    """清除所有缓存"""
+    cache.clear()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -287,20 +316,6 @@ class JSONQueryModel(BaseModel):
     type: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
-
-def validate_jsonpath(path: str) -> bool:
-    """验证 JSONPath 表达式的基本格式"""
-    if not path:
-        return False
-    try:
-        # 如果路径不是以 $ 开头，自动添加
-        if not path.startswith('$'):
-            path = '$.' + path
-        parse_jsonpath(path)
-        return True
-    except Exception as e:
-        logger.warning(f"Invalid JSONPath: {path}, error: {str(e)}")
-        return False
 
 # 健康检查接口
 @router.get("/health",
@@ -635,7 +650,6 @@ async def update_json_object(
             db_object.type = json_data.type
             
             await asyncio.to_thread(db.commit)
-            db.refresh(db_object)
             logger.debug(f"[{request_id}] Database update successful")
             
         except Exception as e:
@@ -668,23 +682,25 @@ async def update_json_object(
         raise HTTPException(status_code=500, detail=str(e))
 
 # JSON对象查询接口
-@router.post("/query/json", response_model=List[JSONObjectResponse])
+@router.post("/query/json", response_model=Dict[str, Any])
 async def query_json_objects(
     query: JSONQueryModel,
     db: Session = Depends(get_db),
-    limit: Optional[int] = 100,
-    offset: Optional[int] = 0
+    limit: Optional[int] = Query(default=100, ge=1, le=5000),
+    offset: Optional[int] = Query(default=0, ge=0)
 ):
     """根据 JSONPath 查询和过滤 JSON 对象"""
     request_id = str(uuid.uuid4())
     
-    # 确保 JSONPath 以 $ 开头
-    if not query.jsonpath.startswith('$'):
-        query.jsonpath = '$.' + query.jsonpath
-        
-    logger.debug(f"[{request_id}] Starting query with path: {query.jsonpath}, type: {query.type}, value: {query.value}, operator: {query.operator}")
-    
     try:
+        # 确保 JSONPath 以 $ 开头
+        if not query.jsonpath or not isinstance(query.jsonpath, str):
+            query.jsonpath = '$'
+        elif not query.jsonpath.startswith('$'):
+            query.jsonpath = '$.' + query.jsonpath
+            
+        logger.debug(f"[{request_id}] Starting query with path: {query.jsonpath}, type: {query.type}, value: {query.value}, operator: {query.operator}")
+        
         # 验证 JSONPath
         if not validate_jsonpath(query.jsonpath):
             logger.warning(f"[{request_id}] Invalid JSONPath: {query.jsonpath}")
@@ -692,12 +708,18 @@ async def query_json_objects(
                 status_code=422, 
                 detail={
                     "error": "Invalid JSONPath",
-                    "message": "请确保 JSONPath 正确匹配数据结构。例如：如果要查询根级别的 'pageId'，使用 '$.pageId' 而不是 '$.content.pageId'"
+                    "message": "请确保 JSONPath 正确匹配数据结构"
                 }
             )
             
-        # 编译 JSONPath 表达式
-        jsonpath_expr = parse_jsonpath(query.jsonpath)
+        # 生成缓存键
+        cache_key = f"query:{hash((query.jsonpath, query.type, query.value, query.operator, offset, limit))}"
+        
+        # 尝试从缓存获取结果
+        cached_result = cache.get(cache_key)
+        if cached_result:
+            logger.debug(f"[{request_id}] Cache hit for query")
+            return cached_result
             
         # 基础查询
         base_query = db.query(ObjectStorageModel).filter(
@@ -708,78 +730,111 @@ async def query_json_objects(
         if query.type:
             base_query = base_query.filter(ObjectStorageModel.type == query.type)
             
-        # 执行查询
-        try:
-            objects = base_query.offset(offset).limit(limit).all()
-            logger.debug(f"[{request_id}] Found {len(objects)} objects from database")
-            
-            # 输出找到的对象的基本信息
+        # 编译 JSONPath 表达式
+        jsonpath_expr = parse_jsonpath(query.jsonpath)
+        
+        # 使用流式处理来减少内存使用
+        chunk_size = min(100, limit)  # 每次处理的记录数
+        filtered_objects = []
+        total_processed = 0
+        
+        def process_chunk(objects):
+            nonlocal total_processed
             for obj in objects:
-                logger.debug(f"[{request_id}] Found object: id={obj.id}, type={obj.type}, content={obj.content[:200]}...")
+                try:
+                    content = json.loads(obj.content)
+                    matches = [match.value for match in jsonpath_expr.find(content)]
+                    
+                    if matches:
+                        if query.value is not None:
+                            match_found = False
+                            for x in matches:
+                                if compare_values(x, query.value, query.operator):
+                                    match_found = True
+                                    break
+                            if not match_found:
+                                continue
+                        
+                        filtered_objects.append((obj, content))
+                        
+                except json.JSONDecodeError:
+                    logger.warning(f"[{request_id}] Invalid JSON in object {obj.id}")
+                    continue
+                except Exception as e:
+                    logger.error(f"[{request_id}] Error processing object {obj.id}: {str(e)}")
+                    continue
+                    
+                total_processed += 1
                 
-        except Exception as e:
-            logger.error(f"[{request_id}] Database error: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error")
-            
-        # 处理结果
-        results = []
-        for obj in objects:
+        def compare_values(x, value, operator):
+            if operator is None:
+                return True
+                
             try:
-                content = json.loads(obj.content)
-                logger.debug(f"[{request_id}] Parsed content for object {obj.id}: {json.dumps(content, indent=2)}")
+                if operator == 'eq':
+                    return x == value
+                elif operator == 'ne':
+                    return x != value
+                elif operator == 'gt':
+                    return float(x) > float(value)
+                elif operator == 'lt':
+                    return float(x) < float(value)
+                elif operator == 'gte':
+                    return float(x) >= float(value)
+                elif operator == 'lte':
+                    return float(x) <= float(value)
+                return False
+            except (ValueError, TypeError):
+                return False
+        
+        # 分块处理数据
+        while True:
+            chunk = base_query.limit(chunk_size).offset(total_processed).all()
+            if not chunk:
+                break
                 
-                # 使用 jsonpath 过滤，但是只在 content 字段内查找
-                matches = [match.value for match in jsonpath_expr.find(content)]
-                logger.debug(f"[{request_id}] JSONPath matches for object {obj.id}: {matches}")
+            process_chunk(chunk)
+            
+            # 如果已经找到足够的结果，可以提前退出
+            if len(filtered_objects) >= offset + limit:
+                break
                 
-                if matches:
-                    # 如果指定了值和操作符，进行进一步过滤
-                    if query.value is not None:
-                        match_found = False
-                        for x in matches:
-                            logger.debug(f"[{request_id}] Comparing value: {x} {query.operator} {query.value}")
-                            if query.operator == 'eq' and x == query.value:
-                                match_found = True
-                                break
-                            elif query.operator == 'ne' and x != query.value:
-                                match_found = True
-                                break
-                            elif query.operator == 'gt' and x > query.value:
-                                match_found = True
-                                break
-                            elif query.operator == 'lt' and x < query.value:
-                                match_found = True
-                                break
-                            elif query.operator == 'gte' and x >= query.value:
-                                match_found = True
-                                break
-                            elif query.operator == 'lte' and x <= query.value:
-                                match_found = True
-                                break
-                                
-                        if not match_found:
-                            logger.debug(f"[{request_id}] No matching value found for object {obj.id}")
-                            continue
-                            
-                    results.append(JSONObjectResponse(
-                        id=obj.id,
-                        name=obj.name,
-                        content_type=obj.content_type,
-                        size=obj.size,
-                        created_at=str(obj.created_at),
-                        type=obj.type,
-                        content=content
-                    ))
-                    logger.debug(f"[{request_id}] Added object {obj.id} to results")
-            except json.JSONDecodeError as e:
-                logger.warning(f"[{request_id}] Invalid JSON in object {obj.id}: {str(e)}")
-                continue
-            except Exception as e:
-                logger.error(f"[{request_id}] Error processing object {obj.id}: {str(e)}")
-                continue
-                
-        logger.info(f"[{request_id}] Query returned {len(results)} matches")
-        return results
+            # 避免无限循环
+            if len(chunk) < chunk_size:
+                break
+        
+        # 计算总数和分页
+        total_count = len(filtered_objects)
+        start_idx = min(offset, total_count)
+        end_idx = min(offset + limit, total_count)
+        paginated_objects = filtered_objects[start_idx:end_idx]
+        
+        # 构建响应
+        results = []
+        for obj, content in paginated_objects:
+            results.append(JSONObjectResponse(
+                id=obj.id,
+                name=obj.name,
+                content_type=obj.content_type,
+                size=obj.size,
+                created_at=str(obj.created_at),
+                type=obj.type,
+                content=content
+            ))
+        
+        # 构建响应数据
+        response_data = {
+            "total": total_count,
+            "offset": offset,
+            "limit": limit,
+            "items": results
+        }
+        
+        # 缓存结果（设置较短的过期时间，因为数据可能会更新）
+        if total_count > 0:
+            cache.set(cache_key, response_data, ttl=60)
+        
+        return response_data
         
     except HTTPException:
         raise
@@ -874,6 +929,13 @@ async def restore_backup(backup_name: str):
 async def get_write_stats():
     """获取写入统计信息"""
     return write_manager.get_stats()
+
+# 清除缓存接口
+@router.post("/clear-cache")
+async def clear_query_cache():
+    """清除查询缓存"""
+    clear_cache()
+    return {"message": "Cache cleared successfully"}
 
 # 注册路由
 app.include_router(router)

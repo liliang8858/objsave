@@ -24,3 +24,4 @@ mypy==0.910
 coverage==5.5
 python-magic-bin==0.4.14; platform_system=='Windows'
 pywin32==306; platform_system=='Windows'
+cachetools==5.3.2
