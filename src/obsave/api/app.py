@@ -683,7 +683,7 @@ async def update_json_object(
 
 # JSON对象查询接口
 @router.post("/query/json", response_model=Dict[str, Any])
-async def query_json_objects(
+def query_json_objects(
     query: JSONQueryModel,
     db: Session = Depends(get_db),
     limit: Optional[int] = Query(default=100, ge=1, le=5000),
@@ -691,6 +691,7 @@ async def query_json_objects(
 ):
     """根据 JSONPath 查询和过滤 JSON 对象"""
     request_id = str(uuid.uuid4())
+    logger.info(f"[{request_id}] Starting query request with limit={limit}, offset={offset}")
     
     try:
         # 确保 JSONPath 以 $ 开头
@@ -699,39 +700,46 @@ async def query_json_objects(
         elif not query.jsonpath.startswith('$'):
             query.jsonpath = '$.' + query.jsonpath
             
-        logger.debug(f"[{request_id}] Starting query with path: {query.jsonpath}, type: {query.type}, value: {query.value}, operator: {query.operator}")
+        logger.info(f"[{request_id}] Query parameters: path={query.jsonpath}, type={query.type}, value={query.value}, operator={query.operator}")
         
         # 验证 JSONPath
-        if not validate_jsonpath(query.jsonpath):
-            logger.warning(f"[{request_id}] Invalid JSONPath: {query.jsonpath}")
+        try:
+            jsonpath_expr = parse_jsonpath(query.jsonpath)
+            logger.debug(f"[{request_id}] JSONPath parsed successfully")
+        except Exception as e:
+            logger.warning(f"[{request_id}] Invalid JSONPath: {query.jsonpath}, error: {str(e)}")
             raise HTTPException(
                 status_code=422, 
                 detail={
                     "error": "Invalid JSONPath",
-                    "message": "请确保 JSONPath 正确匹配数据结构"
+                    "message": f"Invalid JSONPath expression: {str(e)}"
                 }
             )
             
         # 生成缓存键
         cache_key = f"query:{hash((query.jsonpath, query.type, query.value, query.operator, offset, limit))}"
+        logger.debug(f"[{request_id}] Cache key generated: {cache_key}")
         
         # 尝试从缓存获取结果
         cached_result = cache.get(cache_key)
         if cached_result:
-            logger.debug(f"[{request_id}] Cache hit for query")
+            logger.info(f"[{request_id}] Cache hit, returning cached result")
             return cached_result
             
         # 基础查询
-        base_query = db.query(ObjectStorageModel).filter(
-            ObjectStorageModel.content_type == "application/json"
-        )
-        
-        # 添加类型过滤
-        if query.type:
-            base_query = base_query.filter(ObjectStorageModel.type == query.type)
+        try:
+            base_query = db.query(ObjectStorageModel).filter(
+                ObjectStorageModel.content_type == "application/json"
+            )
             
-        # 编译 JSONPath 表达式
-        jsonpath_expr = parse_jsonpath(query.jsonpath)
+            # 添加类型过滤
+            if query.type:
+                base_query = base_query.filter(ObjectStorageModel.type == query.type)
+                
+            logger.debug(f"[{request_id}] Base query constructed")
+        except Exception as e:
+            logger.error(f"[{request_id}] Error constructing base query: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Database query error: {str(e)}")
         
         # 使用流式处理来减少内存使用
         chunk_size = min(100, limit)  # 每次处理的记录数
@@ -742,6 +750,10 @@ async def query_json_objects(
             nonlocal total_processed
             for obj in objects:
                 try:
+                    if not obj.content:
+                        logger.warning(f"[{request_id}] Empty content for object {obj.id}")
+                        continue
+                        
                     content = json.loads(obj.content)
                     matches = [match.value for match in jsonpath_expr.find(content)]
                     
@@ -757,8 +769,8 @@ async def query_json_objects(
                         
                         filtered_objects.append((obj, content))
                         
-                except json.JSONDecodeError:
-                    logger.warning(f"[{request_id}] Invalid JSON in object {obj.id}")
+                except json.JSONDecodeError as je:
+                    logger.warning(f"[{request_id}] Invalid JSON in object {obj.id}: {str(je)}")
                     continue
                 except Exception as e:
                     logger.error(f"[{request_id}] Error processing object {obj.id}: {str(e)}")
@@ -784,24 +796,34 @@ async def query_json_objects(
                 elif operator == 'lte':
                     return float(x) <= float(value)
                 return False
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.warning(f"[{request_id}] Value comparison error: {str(e)}, x={x}, value={value}, operator={operator}")
                 return False
         
         # 分块处理数据
-        while True:
-            chunk = base_query.limit(chunk_size).offset(total_processed).all()
-            if not chunk:
-                break
+        try:
+            while True:
+                chunk = base_query.limit(chunk_size).offset(total_processed).all()
+                if not chunk:
+                    logger.debug(f"[{request_id}] No more chunks to process")
+                    break
+                    
+                logger.debug(f"[{request_id}] Processing chunk of size {len(chunk)}")
+                process_chunk(chunk)
                 
-            process_chunk(chunk)
-            
-            # 如果已经找到足够的结果，可以提前退出
-            if len(filtered_objects) >= offset + limit:
-                break
-                
-            # 避免无限循环
-            if len(chunk) < chunk_size:
-                break
+                # 如果已经找到足够的结果，可以提前退出
+                if len(filtered_objects) >= offset + limit:
+                    logger.debug(f"[{request_id}] Found enough results, stopping early")
+                    break
+                    
+                # 避免无限循环
+                if len(chunk) < chunk_size:
+                    logger.debug(f"[{request_id}] Last chunk processed (size < chunk_size)")
+                    break
+                    
+        except Exception as e:
+            logger.error(f"[{request_id}] Error during chunk processing: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error processing data: {str(e)}")
         
         # 计算总数和分页
         total_count = len(filtered_objects)
@@ -809,38 +831,49 @@ async def query_json_objects(
         end_idx = min(offset + limit, total_count)
         paginated_objects = filtered_objects[start_idx:end_idx]
         
+        logger.info(f"[{request_id}] Found {total_count} matching objects, returning {len(paginated_objects)} items")
+        
         # 构建响应
-        results = []
-        for obj, content in paginated_objects:
-            results.append(JSONObjectResponse(
-                id=obj.id,
-                name=obj.name,
-                content_type=obj.content_type,
-                size=obj.size,
-                created_at=str(obj.created_at),
-                type=obj.type,
-                content=content
-            ))
-        
-        # 构建响应数据
-        response_data = {
-            "total": total_count,
-            "offset": offset,
-            "limit": limit,
-            "items": results
-        }
-        
-        # 缓存结果（设置较短的过期时间，因为数据可能会更新）
-        if total_count > 0:
-            cache.set(cache_key, response_data, ttl=60)
-        
-        return response_data
-        
+        try:
+            results = []
+            for obj, content in paginated_objects:
+                results.append(JSONObjectResponse(
+                    id=obj.id,
+                    name=obj.name,
+                    content_type=obj.content_type,
+                    size=obj.size,
+                    created_at=str(obj.created_at),
+                    type=obj.type,
+                    content=content
+                ))
+                
+            # 构建响应数据
+            response_data = {
+                "total": total_count,
+                "offset": offset,
+                "limit": limit,
+                "items": results
+            }
+            
+            # 缓存结果（设置较短的过期时间，因为数据可能会更新）
+            if total_count > 0:
+                try:
+                    cache[cache_key] = response_data
+                    logger.debug(f"[{request_id}] Results cached with key {cache_key}")
+                except Exception as e:
+                    logger.warning(f"[{request_id}] Failed to cache results: {str(e)}")
+            
+            return response_data
+            
+        except Exception as e:
+            logger.error(f"[{request_id}] Error building response: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error building response: {str(e)}")
+            
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[{request_id}] Query failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"[{request_id}] Unhandled error in query_json_objects: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # 监控相关API
 @router.get("/metrics", 
