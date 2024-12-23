@@ -106,76 +106,72 @@ class CacheKeyManager:
         self._query_objects = {}
         # 用于存储列表缓存键
         self._list_cache_keys = set()
+        # 新增类型缓存键管理
+        self._type_cache_keys = {}
         self._lock = threading.RLock()  # 使用可重入锁
         
     def add_object_cache_key(self, object_id: str, cache_key: str):
         """添加对象相关的缓存键"""
-        try:
-            with self._lock:
-                if object_id not in self._object_cache_keys:
-                    self._object_cache_keys[object_id] = set()
-                self._object_cache_keys[object_id].add(cache_key)
-        except Exception as e:
-            logger.error(f"Error adding object cache key: {str(e)}")
+        with self._lock:
+            if object_id not in self._object_cache_keys:
+                self._object_cache_keys[object_id] = set()
+            self._object_cache_keys[object_id].add(cache_key)
             
     def add_query_result(self, cache_key: str, object_ids: List[str]):
         """记录查询结果中包含的对象ID"""
-        if not object_ids:
-            return
-            
-        try:
-            with self._lock:
-                self._query_objects[cache_key] = set(object_ids)
-                # 为每个对象添加反向引用
-                for obj_id in object_ids:
-                    if obj_id not in self._object_cache_keys:
-                        self._object_cache_keys[obj_id] = set()
-                    self._object_cache_keys[obj_id].add(cache_key)
-        except Exception as e:
-            logger.error(f"Error adding query result: {str(e)}")
-            
+        with self._lock:
+            self._query_objects[cache_key] = set(object_ids)
+            for object_id in object_ids:
+                self.add_object_cache_key(object_id, cache_key)
+                
     def add_list_cache_key(self, cache_key: str):
         """添加列表缓存键"""
-        try:
-            with self._lock:
-                self._list_cache_keys.add(cache_key)
-        except Exception as e:
-            logger.error(f"Error adding list cache key: {str(e)}")
+        with self._lock:
+            self._list_cache_keys.add(cache_key)
             
     def get_related_cache_keys(self, object_id: str) -> Set[str]:
         """获取与对象相关的所有缓存键"""
-        try:
-            with self._lock:
-                # 直接相关的缓存键
-                related_keys = self._object_cache_keys.get(object_id, set()).copy()
-                # 包含该对象的查询结果缓存键
-                for query_key, obj_ids in self._query_objects.items():
-                    if object_id in obj_ids:
-                        related_keys.add(query_key)
-                return related_keys
-        except Exception as e:
-            logger.error(f"Error getting related cache keys: {str(e)}")
-            return set()
+        with self._lock:
+            # 获取直接关联的缓存键
+            related_keys = self._object_cache_keys.get(object_id, set()).copy()
+            # 获取包含此对象的查询缓存键
+            for cache_key, objects in self._query_objects.items():
+                if object_id in objects:
+                    related_keys.add(cache_key)
+            return related_keys
             
-    def clear_object_cache_keys(self, object_id: str) -> Set[str]:
+    def clear_object_cache_keys(self, object_id: str):
         """清除对象相关的所有缓存键记录"""
-        try:
-            with self._lock:
-                # 获取所有相关的缓存键
-                related_keys = self.get_related_cache_keys(object_id)
-                # 从所有映射中删除这些键
-                self._object_cache_keys.pop(object_id, None)
-                keys_to_remove = []
-                for key in self._query_objects:
-                    if key in related_keys:
-                        keys_to_remove.append(key)
-                for key in keys_to_remove:
-                    self._query_objects.pop(key, None)
-                return related_keys
-        except Exception as e:
-            logger.error(f"Error clearing object cache keys: {str(e)}")
-            return set()
-            
+        with self._lock:
+            self._object_cache_keys.pop(object_id, None)
+            # 清理查询结果中的对象引用
+            keys_to_remove = []
+            for cache_key, objects in self._query_objects.items():
+                if object_id in objects:
+                    objects.remove(object_id)
+                    if not objects:  # 如果集合为空，标记为删除
+                        keys_to_remove.append(cache_key)
+            # 删除空的查询结果记录
+            for key in keys_to_remove:
+                self._query_objects.pop(key, None)
+                
+    def add_type_cache_key(self, type_name: str, cache_key: str):
+        """记录类型相关的缓存键"""
+        with self._lock:
+            if type_name not in self._type_cache_keys:
+                self._type_cache_keys[type_name] = set()
+            self._type_cache_keys[type_name].add(cache_key)
+
+    def get_type_cache_keys(self, type_name: str) -> Set[str]:
+        """获取类型相关的所有缓存键"""
+        with self._lock:
+            return self._type_cache_keys.get(type_name, set()).copy()
+
+    def clear_type_cache_keys(self, type_name: str):
+        """清理类型相关的缓存键记录"""
+        with self._lock:
+            self._type_cache_keys.pop(type_name, None)
+                
     def clear_all(self):
         """清除所有缓存键记录"""
         try:
@@ -183,6 +179,7 @@ class CacheKeyManager:
                 self._object_cache_keys.clear()
                 self._query_objects.clear()
                 self._list_cache_keys.clear()
+                self._type_cache_keys.clear()
         except Exception as e:
             logger.error(f"Error clearing all cache keys: {str(e)}")
 
@@ -191,15 +188,18 @@ class AsyncCacheInvalidator:
     
     def __init__(self):
         self._queue = Queue()
-        self._thread = threading.Thread(target=self._process_queue, daemon=True)
+        self._type_queue = Queue()  # 新增类型缓存清理队列
         self._running = True
-        self._thread.start()
+        # 启动两个独立的清理线程
+        self._object_thread = threading.Thread(target=self._process_object_queue, daemon=True)
+        self._type_thread = threading.Thread(target=self._process_type_queue, daemon=True)
+        self._object_thread.start()
+        self._type_thread.start()
         
-    def _process_queue(self):
-        """处理缓存清理队列"""
+    def _process_object_queue(self):
+        """处理对象级别的缓存清理"""
         while self._running:
             try:
-                # 从队列获取任务，最多等待1秒
                 task = self._queue.get(timeout=1)
                 if task is None:
                     continue
@@ -218,32 +218,71 @@ class AsyncCacheInvalidator:
                     # 删除所有相关的查询缓存
                     for key in related_keys:
                         safe_cache_pop(query_cache, key)
-                        safe_cache_pop(list_cache, key)
                     
                     # 清除缓存键记录
                     cache_key_manager.clear_object_cache_keys(object_id)
                     logger.info(f"Async cache invalidation completed for object {object_id}")
                     
                 except Exception as e:
-                    logger.error(f"Error in async cache invalidation for object {object_id}: {str(e)}")
+                    logger.error(f"Error in object cache invalidation: {str(e)}")
                     
             except Empty:
                 continue
             except Exception as e:
-                logger.error(f"Error in cache invalidation thread: {str(e)}")
+                logger.error(f"Error in object cache invalidation thread: {str(e)}")
+
+    def _process_type_queue(self):
+        """处理类型级别的缓存清理"""
+        while self._running:
+            try:
+                task = self._type_queue.get(timeout=1)
+                if task is None:
+                    continue
+
+                type_name = task
+                logger.debug(f"Processing async cache invalidation for type {type_name}")
                 
-    def invalidate(self, object_id: str, operation: str):
+                try:
+                    # 获取类型相关的所有缓存键
+                    type_keys = cache_key_manager.get_type_cache_keys(type_name)
+                    
+                    # 分批处理缓存清理
+                    for key in type_keys:
+                        safe_cache_pop(query_cache, key)
+                        safe_cache_pop(list_cache, key)
+                    
+                    # 清理类型缓存键记录
+                    cache_key_manager.clear_type_cache_keys(type_name)
+                    logger.info(f"Async cache invalidation completed for type {type_name}")
+                    
+                except Exception as e:
+                    logger.error(f"Error in type cache invalidation: {str(e)}")
+                    
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in type cache invalidation thread: {str(e)}")
+
+    def invalidate(self, object_id: str, operation: str, type_name: Optional[str] = None):
         """添加缓存失效任务到队列"""
         try:
+            # 添加对象级别的缓存失效任务
             self._queue.put_nowait((object_id, operation))
-            logger.debug(f"Queued cache invalidation for object {object_id}, operation: {operation}")
+            logger.debug(f"Queued object cache invalidation for object {object_id}, operation: {operation}")
+            
+            # 如果指定了类型，添加类型级别的缓存失效任务
+            if type_name:
+                self._type_queue.put_nowait(type_name)
+                logger.debug(f"Queued type cache invalidation for type {type_name}")
+                
         except Exception as e:
             logger.error(f"Error queuing cache invalidation: {str(e)}")
             
     def stop(self):
         """停止缓存清理线程"""
         self._running = False
-        self._thread.join(timeout=5)
+        self._object_thread.join(timeout=5)
+        self._type_thread.join(timeout=5)
 
 def safe_cache_pop(cache, key: str) -> None:
     """安全地删除缓存值"""
@@ -295,7 +334,7 @@ def invalidate_cache(object_id: Optional[str] = None):
             except Exception as e:
                 logger.error(f"Error clearing all caches: {str(e)}")
     except Exception as e:
-        logger.error(f"Error in invalidate_cache: {str(e)}")
+        logger.error(f"Error invalidating cache for object_id {object_id}: {str(e)}")
 
 def safe_cache_set(cache, key: str, value: Any):
     """安全地设置缓存值"""
@@ -782,8 +821,8 @@ async def upload_json_object(
         
         logger.info(f"[{request_id}] Upload queued successfully")
         
-        # 异步触发缓存清理
-        cache_invalidator.invalidate(object_id, "create")
+        # 异步触发缓存清理，包含类型信息
+        cache_invalidator.invalidate(object_id, "create", json_data.type)
         
         return metadata
         
@@ -1025,6 +1064,10 @@ def query_json_objects(
         cache_key = f"query:{hash((query.jsonpath, query.type, query.value, query.operator, offset, limit))}"
         logger.debug(f"[{request_id}] Cache key generated: {cache_key}")
         
+        # 如果是类型查询，记录缓存键与类型的关系
+        if query.type:
+            cache_key_manager.add_type_cache_key(query.type, cache_key)
+            
         # 尝试从缓存获取结果
         cached_result = safe_cache_get(query_cache, cache_key)
         if cached_result:
