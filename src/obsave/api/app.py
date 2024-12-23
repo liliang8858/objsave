@@ -1,6 +1,6 @@
 import os
 import uuid
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union, Set
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, APIRouter, Request, Response, BackgroundTasks
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,9 +19,9 @@ from contextlib import asynccontextmanager
 from jsonpath_ng import parse as parse_jsonpath
 from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Query, Body
 from fastapi.responses import FileResponse, JSONResponse
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Set
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, or_
 import json
 import uuid
 import logging
@@ -29,6 +29,8 @@ import os
 from cachetools import TTLCache
 from datetime import datetime, timedelta
 from jsonpath_ng import parse as parse_jsonpath
+from sqlalchemy.exc import SQLAlchemyError
+import threading
 
 from obsave.core.storage import ObjectStorage
 from obsave.core.exceptions import StorageError, ObjectNotFoundError, ObjSaveException
@@ -82,6 +84,117 @@ storage = ObjectStorage(
     chunk_size=settings.CHUNK_SIZE,  
     max_concurrent_ops=settings.MAX_WORKERS  
 )
+
+# 缓存配置
+CACHE_CONFIG = {
+    'DEFAULT_TTL': 60,  # 默认缓存时间（秒）
+    'MAX_SIZE': 1000,   # 最大缓存条目数
+    'QUERY_TTL': 30,    # 查询结果缓存时间
+    'LIST_TTL': 60,     # 列表缓存时间
+    'METADATA_TTL': 300 # 元数据缓存时间
+}
+
+class CacheKeyManager:
+    """缓存键管理器，用于跟踪缓存键之间的关系"""
+    
+    def __init__(self):
+        # 存储对象ID到缓存键的映射
+        self._object_cache_keys = {}
+        # 存储查询结果中包含的对象ID
+        self._query_objects = {}
+        # 用于存储列表缓存键
+        self._list_cache_keys = set()
+        self._lock = threading.Lock()
+        
+    def add_object_cache_key(self, object_id: str, cache_key: str):
+        """添加对象相关的缓存键"""
+        with self._lock:
+            if object_id not in self._object_cache_keys:
+                self._object_cache_keys[object_id] = set()
+            self._object_cache_keys[object_id].add(cache_key)
+            
+    def add_query_result(self, cache_key: str, object_ids: List[str]):
+        """记录查询结果中包含的对象ID"""
+        with self._lock:
+            self._query_objects[cache_key] = set(object_ids)
+            # 为每个对象添加反向引用
+            for obj_id in object_ids:
+                self.add_object_cache_key(obj_id, cache_key)
+                
+    def add_list_cache_key(self, cache_key: str):
+        """添加列表缓存键"""
+        with self._lock:
+            self._list_cache_keys.add(cache_key)
+            
+    def get_related_cache_keys(self, object_id: str) -> Set[str]:
+        """获取与对象相关的所有缓存键"""
+        with self._lock:
+            # 直接相关的缓存键
+            related_keys = self._object_cache_keys.get(object_id, set()).copy()
+            # 包含该对象的查询结果缓存键
+            for query_key, obj_ids in self._query_objects.items():
+                if object_id in obj_ids:
+                    related_keys.add(query_key)
+            return related_keys
+            
+    def clear_object_cache_keys(self, object_id: str):
+        """清除对象相关的所有缓存键记录"""
+        with self._lock:
+            # 获取所有相关的缓存键
+            related_keys = self.get_related_cache_keys(object_id)
+            # 从所有映射中删除这些键
+            self._object_cache_keys.pop(object_id, None)
+            for key in list(self._query_objects.keys()):
+                if key in related_keys:
+                    self._query_objects.pop(key)
+            return related_keys
+            
+    def clear_all(self):
+        """清除所有缓存键记录"""
+        with self._lock:
+            self._object_cache_keys.clear()
+            self._query_objects.clear()
+            self._list_cache_keys.clear()
+
+# 初始化缓存和缓存键管理器
+query_cache = TTLCache(maxsize=CACHE_CONFIG['MAX_SIZE'], ttl=CACHE_CONFIG['QUERY_TTL'])
+list_cache = TTLCache(maxsize=CACHE_CONFIG['MAX_SIZE'], ttl=CACHE_CONFIG['LIST_TTL'])
+metadata_cache = TTLCache(maxsize=CACHE_CONFIG['MAX_SIZE'], ttl=CACHE_CONFIG['METADATA_TTL'])
+cache_key_manager = CacheKeyManager()
+
+def invalidate_cache(object_id: Optional[str] = None):
+    """使缓存失效"""
+    if object_id:
+        # 获取所有相关的缓存键
+        related_keys = cache_key_manager.get_related_cache_keys(object_id)
+        
+        # 删除对象的直接缓存
+        query_cache.pop(f"content:{object_id}", None)
+        metadata_cache.pop(f"metadata:{object_id}", None)
+        
+        # 删除所有相关的查询缓存
+        for key in related_keys:
+            query_cache.pop(key, None)
+            list_cache.pop(key, None)
+            
+        # 清除缓存键记录
+        cache_key_manager.clear_object_cache_keys(object_id)
+        logger.info(f"Cache invalidated for object {object_id} and related queries")
+    else:
+        # 删除所有缓存
+        query_cache.clear()
+        list_cache.clear()
+        metadata_cache.clear()
+        cache_key_manager.clear_all()
+        logger.info("All caches invalidated")
+
+def clear_all_caches():
+    """清除所有缓存"""
+    query_cache.clear()
+    list_cache.clear()
+    metadata_cache.clear()
+    cache_key_manager.clear_all()
+    logger.info("All caches cleared")
 
 # 初始化缓存管理器
 cache = CacheManager(
@@ -389,6 +502,9 @@ async def upload_object(
             metrics.record("objects_uploaded_total", 1)
             metrics.record("bytes_uploaded_total", file.size)
             
+            # 立即使缓存失效
+            invalidate_cache()
+            
             return metadata
             
         except Exception as e:
@@ -448,7 +564,7 @@ async def list_objects(
     
     try:
         cache_key = f"list:last_id={last_id}:limit={limit}:offset={offset}"
-        cached_data = cache.get(cache_key)
+        cached_data = list_cache.get(cache_key)
         if cached_data:
             logger.debug(f"[{request_id}] Cache hit for {cache_key}")
             return cached_data
@@ -473,7 +589,9 @@ async def list_objects(
         ]
         
         # 缓存结果
-        cache.set(cache_key, result, ttl=60)  
+        list_cache.set(cache_key, result, ttl=CACHE_CONFIG['LIST_TTL'])  
+        cache_key_manager.add_list_cache_key(cache_key)
+        cache_key_manager.add_query_result(cache_key, [obj.id for obj in objects])
         logger.debug(f"[{request_id}] Successfully listed {len(result)} objects")
         
         return result
@@ -539,6 +657,10 @@ async def upload_json_object(
         )
         
         logger.info(f"[{request_id}] Upload queued successfully")
+        
+        # 立即使缓存失效
+        invalidate_cache()
+        
         return metadata
         
     except HTTPException:
@@ -601,7 +723,7 @@ async def upload_json_objects_batch(
                 
                 # 异步缓存
                 try:
-                    cache.set(f"metadata:{obj.id}", metadata.dict())
+                    metadata_cache.set(f"metadata:{obj.id}", metadata.dict())
                 except Exception as e:
                     logger.error(f"[{request_id}] Cache error for object {obj.id}: {str(e)}")
                     
@@ -611,6 +733,10 @@ async def upload_json_objects_batch(
             raise HTTPException(status_code=500, detail="Database error")
             
         logger.info(f"[{request_id}] Successfully uploaded {len(metadata_list)} objects")
+        
+        # 立即使缓存失效
+        invalidate_cache()
+        
         return metadata_list
         
     except Exception as e:
@@ -667,18 +793,69 @@ async def update_json_object(
         )
         
         try:
-            cache.set(f"metadata:{object_id}", metadata.dict())
-            cache.set(f"content:{object_id}", json_data.content)
+            metadata_cache.set(f"metadata:{object_id}", metadata.dict())
+            query_cache.set(f"content:{object_id}", json_data.content)
         except Exception as e:
             logger.error(f"[{request_id}] Cache error: {str(e)}")
             
         logger.info(f"[{request_id}] Successfully updated object {object_id}")
+        
+        # 立即使缓存失效
+        invalidate_cache(object_id)
+        
         return metadata
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"[{request_id}] Update failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# JSON对象更新接口
+@router.put("/update/json/{object_id}", response_model=ObjectMetadata)
+def update_json_object(
+    object_id: str,
+    content: Dict[str, Any],
+    db: Session = Depends(get_db)
+):
+    """更新 JSON 对象的内容"""
+    try:
+        # 查找对象
+        db_object = db.query(ObjectStorageModel).filter(ObjectStorageModel.id == object_id).first()
+        if not db_object:
+            raise HTTPException(status_code=404, detail="Object not found")
+            
+        # 验证内容类型
+        if db_object.content_type != "application/json":
+            raise HTTPException(status_code=400, detail="Object is not a JSON object")
+            
+        # 更新内容
+        db_object.content = json.dumps(content)
+        db_object.size = len(db_object.content)
+        db_object.updated_at = datetime.utcnow()
+        
+        try:
+            # 提交更改
+            db.commit()
+            # 清除会话缓存
+            db.expire_all()
+            # 刷新对象
+            db.refresh(db_object)
+            # 立即使缓存失效
+            invalidate_cache(object_id)
+            
+            logger.info(f"Successfully updated JSON object {object_id}")
+            return db_object
+            
+        except SQLAlchemyError as e:
+            db.rollback()
+            logger.error(f"Database error while updating object {object_id}: {str(e)}")
+            raise HTTPException(status_code=500, detail="Database error")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating JSON object {object_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # JSON对象查询接口
@@ -694,6 +871,9 @@ def query_json_objects(
     logger.info(f"[{request_id}] Starting query request with limit={limit}, offset={offset}")
     
     try:
+        # 确保会话是干净的
+        db.expire_all()
+        
         # 确保 JSONPath 以 $ 开头
         if not query.jsonpath or not isinstance(query.jsonpath, str):
             query.jsonpath = '$'
@@ -721,7 +901,7 @@ def query_json_objects(
         logger.debug(f"[{request_id}] Cache key generated: {cache_key}")
         
         # 尝试从缓存获取结果
-        cached_result = cache.get(cache_key)
+        cached_result = query_cache.get(cache_key)
         if cached_result:
             logger.info(f"[{request_id}] Cache hit, returning cached result")
             return cached_result
@@ -858,7 +1038,8 @@ def query_json_objects(
             # 缓存结果（设置较短的过期时间，因为数据可能会更新）
             if total_count > 0:
                 try:
-                    cache[cache_key] = response_data
+                    query_cache[cache_key] = response_data
+                    cache_key_manager.add_query_result(cache_key, [obj.id for obj, _ in filtered_objects])
                     logger.debug(f"[{request_id}] Results cached with key {cache_key}")
                 except Exception as e:
                     logger.warning(f"[{request_id}] Failed to cache results: {str(e)}")
@@ -885,6 +1066,11 @@ async def search_objects(
     db: Session = Depends(get_db)
 ):
     """搜索对象"""
+    cache_key = f"search:query={query}:skip={skip}:limit={limit}:type={type}"
+    cached_result = list_cache.get(cache_key)
+    if cached_result:
+        return cached_result
+        
     search_query = db.query(ObjectStorageModel).order_by(ObjectStorageModel.created_at.desc())
     
     # 添加搜索条件
@@ -900,6 +1086,13 @@ async def search_objects(
         search_query = search_query.filter(ObjectStorageModel.type == type)
     
     objects = search_query.offset(skip).limit(limit).all()
+    
+    # 缓存结果
+    if objects:
+        list_cache[cache_key] = objects
+        cache_key_manager.add_list_cache_key(cache_key)
+        cache_key_manager.add_query_result(cache_key, [obj.id for obj in objects])
+        
     return objects
 
 # 监控相关API
@@ -993,9 +1186,9 @@ async def get_write_stats():
 # 清除缓存接口
 @router.post("/clear-cache")
 async def clear_query_cache():
-    """清除查询缓存"""
-    clear_cache()
-    return {"message": "Cache cleared successfully"}
+    """清除所有缓存"""
+    clear_all_caches()
+    return {"message": "All caches cleared successfully"}
 
 # 注册路由
 app.include_router(router)
