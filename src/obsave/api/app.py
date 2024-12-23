@@ -454,11 +454,11 @@ async def list_objects(
             return cached_data
             
         # 直接在当前线程执行数据库操作
-        query = db.query(ObjectStorageModel)
+        query = db.query(ObjectStorageModel).order_by(ObjectStorageModel.created_at.desc())
         if last_id:
             query = query.filter(ObjectStorageModel.id > last_id)
             
-        objects = query.order_by(ObjectStorageModel.created_at.desc()).offset(offset).limit(limit).all()
+        objects = query.offset(offset).limit(limit).all()
         
         result = [
             ObjectMetadata(
@@ -730,13 +730,13 @@ def query_json_objects(
         try:
             base_query = db.query(ObjectStorageModel).filter(
                 ObjectStorageModel.content_type == "application/json"
-            )
+            ).order_by(ObjectStorageModel.created_at.desc())  # 按创建时间倒序排序
             
             # 添加类型过滤
             if query.type:
                 base_query = base_query.filter(ObjectStorageModel.type == query.type)
                 
-            logger.debug(f"[{request_id}] Base query constructed")
+            logger.debug(f"[{request_id}] Base query constructed with time-based sorting")
         except Exception as e:
             logger.error(f"[{request_id}] Error constructing base query: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Database query error: {str(e)}")
@@ -874,6 +874,33 @@ def query_json_objects(
     except Exception as e:
         logger.error(f"[{request_id}] Unhandled error in query_json_objects: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# 搜索接口
+@router.get("/search", response_model=List[ObjectMetadata])
+async def search_objects(
+    query: str,
+    skip: int = 0,
+    limit: int = 100,
+    type: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """搜索对象"""
+    search_query = db.query(ObjectStorageModel).order_by(ObjectStorageModel.created_at.desc())
+    
+    # 添加搜索条件
+    if query:
+        search_query = search_query.filter(
+            or_(
+                ObjectStorageModel.name.ilike(f"%{query}%"),
+                ObjectStorageModel.content.ilike(f"%{query}%")
+            )
+        )
+    
+    if type:
+        search_query = search_query.filter(ObjectStorageModel.type == type)
+    
+    objects = search_query.offset(skip).limit(limit).all()
+    return objects
 
 # 监控相关API
 @router.get("/metrics", 
